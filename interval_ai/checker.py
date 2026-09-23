@@ -23,10 +23,12 @@ from dataclasses import dataclass, field
 
 from .cfg import (
     CFG,
+    AssertDiff,
     AssertRange,
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssumeDiff,
     Block,
     Guard,
     Statement,
@@ -118,6 +120,8 @@ def _ref_transfer_stmt(env, stmt: Statement):
         out[stmt.target] = _ref_add_iv(out[stmt.source], stmt.const)
     elif isinstance(stmt, AssertRange):
         pass  # 检查性语句不改变状态
+    elif isinstance(stmt, (AssumeDiff, AssertDiff)):
+        pass  # 区间参考视图无法表达关系语句：不改变逐变量区间
     else:  # pragma: no cover - CFG 构造期已挡住
         raise TypeError(f"unsupported statement: {type(stmt).__name__}")
     return out
@@ -150,6 +154,215 @@ def _ref_state_subseteq(a, b) -> bool:
     if set(a) != set(b):
         return False
     return all(_ref_iv_subseteq(a[v], b[v]) for v in a)
+
+
+# -- 独立的差界矩阵参考（与 dbm.py 平行重写，互不导入） -------------------------
+#
+# 节点 0 为值恒 0 的参考点，节点 i>=1 为第 i-1 个变量；矩阵元素 d[i][j]
+# 是最紧的 x_i - x_j <= d[i][j]，None 表示 +∞。以下闭包、赋值、假设、
+# 守卫过滤都在此按 Floyd-Warshall 与差界语义独立实现，不调用关系域核心。
+
+_RInf = None  # +∞
+
+
+def _indices(n: int):
+    """矩阵节点索引 0..n-1（纯索引遍历，绝不枚举变量取值）。"""
+    i = 0
+    while i < n:
+        yield i
+        i += 1
+
+
+def _r_fresh(n: int):
+    m = [[_RInf] * n for _ in _indices(n)]
+    for i in _indices(n):
+        m[i][i] = 0
+    return m
+
+
+def _r_closure(m):
+    n = len(m)
+    d = [list(row) for row in m]
+    for k in _indices(n):
+        dk = d[k]
+        for i in _indices(n):
+            dik = d[i][k]
+            if dik is _RInf:
+                continue
+            di = d[i]
+            for j in _indices(n):
+                dkj = dk[j]
+                if dkj is _RInf:
+                    continue
+                cand = dik + dkj
+                if di[j] is _RInf or cand < di[j]:
+                    di[j] = cand
+    for i in _indices(n):
+        if d[i][i] < 0:
+            return None
+    return d
+
+
+def _r_set(m, i, j, bound):
+    if m[i][j] is _RInf or bound < m[i][j]:
+        m[i][j] = bound
+
+
+def _r_forget(m, i):
+    n = len(m)
+    for k in _indices(n):
+        if k != i:
+            m[i][k] = _RInf
+            m[k][i] = _RInf
+
+
+def _r_reduce(variables, env, m):
+    """区间注入零节点边 -> 闭包 -> 端点抽回区间；不可行返回 None。"""
+    for k, v in enumerate(variables, start=1):
+        lo, hi = env[v]
+        if hi is not None:
+            _r_set(m, k, 0, hi)
+        if lo is not None:
+            _r_set(m, 0, k, -lo)
+    closed = _r_closure(m)
+    if closed is None:
+        return None
+    out_env = dict(env)
+    for k, v in enumerate(variables, start=1):
+        hi = closed[k][0]
+        lo = None if closed[0][k] is None else -closed[0][k]
+        projected = (lo, hi)
+        old = env[v]
+        # 与旧区间取交（端点偏序下的逐点 min/max）
+        nlo = (
+            projected[0]
+            if old[0] is None
+            else (old[0] if projected[0] is None else max(old[0], projected[0]))
+        )
+        nhi = (
+            projected[1]
+            if old[1] is None
+            else (old[1] if projected[1] is None else min(old[1], projected[1]))
+        )
+        out_env[v] = (nlo, nhi)
+    return out_env, closed
+
+
+# 积参考状态：_BOTTOM 或 (env: dict[str, Bound], matrix: list[list])
+_RP_BOTTOM = object()
+
+
+def _rp_from_core(abstract_state, diff_state):
+    """由引擎的 (AbstractState, DiffState) 组装独立积参考状态。"""
+    if abstract_state.bottom or (diff_state is not None and diff_state.bottom):
+        return _RP_BOTTOM
+    env = _from_abstract(abstract_state)
+    if diff_state is None:
+        return env  # 纯区间形态
+    return env, [list(row) for row in diff_state.matrix]
+
+
+def _rp_transfer_stmt(prod, stmt, variables):
+    if prod is _RP_BOTTOM:
+        return _RP_BOTTOM
+    env, m = prod
+    n = len(variables) + 1
+    if isinstance(stmt, AssignConst):
+        env = dict(env)
+        env[stmt.target] = (stmt.const, stmt.const)
+        ti = variables.index(stmt.target) + 1
+        m = [list(row) for row in m]
+        _r_forget(m, ti)
+        _r_set(m, ti, 0, stmt.const)
+        _r_set(m, 0, ti, -stmt.const)
+    elif isinstance(stmt, AssignCopy):
+        env = dict(env)
+        env[stmt.target] = env[stmt.source]
+        ti = variables.index(stmt.target) + 1
+        si = variables.index(stmt.source) + 1
+        m = [list(row) for row in m]
+        if ti != si:
+            _r_forget(m, ti)
+            _r_set(m, ti, si, 0)
+            _r_set(m, si, ti, 0)
+    elif isinstance(stmt, AssignAdd):
+        env = dict(env)
+        env[stmt.target] = _ref_add_iv(env[stmt.source], stmt.const)
+        ti = variables.index(stmt.target) + 1
+        si = variables.index(stmt.source) + 1
+        m = [list(row) for row in m]
+        if ti == si:
+            k = stmt.const
+            for j in _indices(n):
+                if j != ti and m[ti][j] is not _RInf:
+                    m[ti][j] += k
+            for i in _indices(n):
+                if i != ti and m[i][ti] is not _RInf:
+                    m[i][ti] -= k
+            m[ti][ti] = 0
+        else:
+            _r_forget(m, ti)
+            _r_set(m, ti, si, stmt.const)
+            _r_set(m, si, ti, -stmt.const)
+    elif isinstance(stmt, AssumeDiff):
+        ai = variables.index(stmt.a) + 1
+        bi = variables.index(stmt.b) + 1
+        m = [list(row) for row in m]
+        _r_set(m, ai, bi, stmt.const)
+        reduced = _r_reduce(variables, dict(env), m)
+        if reduced is None:
+            return _RP_BOTTOM
+        return reduced
+    elif isinstance(stmt, (AssertRange, AssertDiff)):
+        pass
+    else:  # pragma: no cover - CFG 构造期已挡住
+        raise TypeError(f"unsupported statement: {type(stmt).__name__}")
+    reduced = _r_reduce(variables, env, m)
+    if reduced is None:
+        return _RP_BOTTOM
+    return reduced
+
+
+def _rp_transfer_block(prod, block: Block, variables):
+    for stmt in block.statements:
+        prod = _rp_transfer_stmt(prod, stmt, variables)
+    return prod
+
+
+def _rp_filter_guard(prod, guard: Guard, taken: bool, variables):
+    if prod is _RP_BOTTOM:
+        return _RP_BOTTOM
+    env, m = prod
+    hit = _ref_intersect_iv(env[guard.variable], _ref_guard_bound(guard, taken))
+    if hit is None:
+        return _RP_BOTTOM
+    env = dict(env)
+    env[guard.variable] = hit
+    reduced = _r_reduce(variables, env, [list(row) for row in m])
+    if reduced is None:
+        return _RP_BOTTOM
+    return reduced
+
+
+def _rp_subseteq(a, b) -> bool:
+    """积参考包含：底 ⊆ 一切；区间逐端点且 DBM 逐差界。"""
+    if a is _RP_BOTTOM:
+        return True
+    if b is _RP_BOTTOM:
+        return False
+    env_a, m_a = a
+    env_b, m_b = b
+    if not all(_ref_iv_subseteq(env_a[v], env_b[v]) for v in env_a):
+        return False
+    n = len(m_a)
+    for i in _indices(n):
+        for j in _indices(n):
+            bb = m_b[i][j]
+            if bb is not _RInf:
+                aa = m_a[i][j]
+                if aa is _RInf or aa > bb:
+                    return False
+    return True
 
 
 # -- 报告 ----------------------------------------------------------------------
@@ -212,10 +425,22 @@ def check_edge_guard(
 # -- 整个分析结果的局部健全性检查 ----------------------------------------------
 
 def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
-    """对引擎结果逐块、逐边、逐断言做独立符号包含性检查。"""
+    """对引擎结果逐块、逐边、逐断言做独立符号包含性检查。
+
+    含差分约束的程序使用独立重写的"区间 × 差界矩阵"积参考：块像、边过滤、
+    入口包含在积上逐端点且逐差界比较；纯区间程序沿用区间参考。
+    """
     cfg = cfg or result.cfg
     report = CheckReport()
 
+    if cfg.uses_diff_domain:
+        _check_product_soundness(result, cfg, report)
+    else:
+        _check_interval_soundness(result, cfg, report)
+    return report
+
+
+def _check_interval_soundness(result, cfg: CFG, report: CheckReport) -> None:
     # 1) 入口初始区间 ⊆ 入口块入不变量
     entry_in = _from_abstract(result.block_in[cfg.entry])
     initial = {
@@ -258,6 +483,81 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
                 )
 
     # 5) 断言结论的独立复核
+    _check_range_asserts(result, report)
+
+
+def _check_product_soundness(result, cfg: CFG, report: CheckReport) -> None:
+    variables = tuple(cfg.variables)
+
+    # 关系域未收敛（预算耗尽）：区间部分是一次合法的纯区间分析结果
+    # （区间转移忽略差分语句），仍须满足全部区间局部关系；差分断言必须
+    # 全为 unknown（未收敛不冒充任何证明，不可达空真也不允许）。
+    truncated = bool(getattr(result, "relation_truncated", False))
+    if truncated:
+        _check_interval_soundness(result, cfg, report)
+        _check_diff_asserts(result, cfg, report, truncated)
+        return
+
+    # 1) 入口初始区间 ⊆ 入口入（积投影），且入口差界必须蕴含入口区间
+    entry_prod = _rp_from_core(
+        result.block_in[cfg.entry], result.diff_in[cfg.entry]
+    )
+    initial = {
+        v: cfg.entry_bounds[v] if v in cfg.entry_bounds else Interval(None, None)
+        for v in cfg.variables
+    }
+    init_env = {v: (iv.lower, iv.upper) for v, iv in initial.items()}
+    init_prod = _r_reduce(variables, init_env, _r_fresh(len(variables) + 1))
+    if not _rp_subseteq(init_prod, entry_prod):
+        report.fail(
+            f"block {cfg.entry!r}.in",
+            "entry product state does not contain declared entry bounds",
+        )
+
+    for name, block in cfg.blocks.items():
+        bloc = f"block {name!r}"
+        in_s = result.block_in[name]
+        out_s = result.block_out[name]
+        d_in = result.diff_in[name]
+        d_out = result.diff_out[name]
+
+        prod_in = _rp_from_core(in_s, d_in)
+        prod_out_core = _rp_from_core(out_s, d_out)
+
+        # 2) 块转移：独立积参考像必须 == 核心积出状态
+        ref_out = _rp_transfer_block(prod_in, block, variables)
+        if not _rp_subseteq(ref_out, prod_out_core):
+            report.fail(f"{bloc}.out",
+                        "product block-out does not contain reference image (unsound)")
+        if not _rp_subseteq(prod_out_core, ref_out):
+            report.fail(f"{bloc}.out",
+                        "product block-out is strictly coarser than reference image")
+
+        # 3) 入底 ⇒ 出底
+        if in_s.bottom and not out_s.bottom:
+            report.fail(f"{bloc}.out", "block-in is bottom but block-out is not")
+
+        # 4) 每条边：守卫过滤后的积状态 ⊆ 后继积入
+        for i, succ in enumerate(block.successors):
+            if block.guard is None:
+                edge = prod_out_core
+            else:
+                edge = _rp_filter_guard(
+                    prod_out_core, block.guard, i == 0, variables
+                )
+            succ_prod = _rp_from_core(result.block_in[succ], result.diff_in[succ])
+            if not _rp_subseteq(edge, succ_prod):
+                side = "true" if i == 0 else "false"
+                report.fail(
+                    f"{bloc}.successors[{i}]({side}) -> {succ!r}",
+                    "product edge state not contained in successor block-in",
+                )
+
+    _check_range_asserts(result, report)
+    _check_diff_asserts(result, cfg, report, truncated)
+
+
+def _check_range_asserts(result, report: CheckReport) -> None:
     for st in result.asserts:
         loc = f"block {st.block!r}.assert[{st.index}]"
         if st.verdict not in ("proved", "unknown"):
@@ -271,4 +571,38 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
                     loc,
                     f"marked proved but observed {observed} not contained in {required}",
                 )
-    return report
+
+
+def _check_diff_asserts(result, cfg: CFG, report: CheckReport, truncated: bool) -> None:
+    for st in result.diff_asserts:
+        loc = f"block {st.block!r}.diff_assert[{st.index}]"
+        if st.verdict not in ("proved", "unknown"):
+            report.fail(loc, f"illegal verdict {st.verdict!r}")
+            continue
+        if truncated and st.verdict == "proved" and not st.vacuous:
+            report.fail(loc, "relation domain truncated but a diff assert is proved")
+            continue
+        if st.verdict != "proved" or st.vacuous:
+            continue
+        # 独立复核：从块入开始把该 AssertDiff 之前的语句独立走一遍
+        # （AssumeDiff 会真实改变积状态），位置状态必须符号蕴含 a - b <= c。
+        cur = _rp_from_core(
+            result.block_in[st.block], result.diff_in[st.block]
+        )
+        ai = cfg.variables.index(st.statement.a) + 1
+        bi = cfg.variables.index(st.statement.b) + 1
+        for i, ps in enumerate(cfg.blocks[st.block].statements):
+            if i == st.index:
+                break
+            cur = _rp_transfer_stmt(cur, ps, tuple(cfg.variables))
+        if cur is _RP_BOTTOM:
+            report.fail(loc, "marked proved but statement position is unreachable")
+            continue
+        _, mm = cur
+        d = mm[ai][bi]
+        if d is None or d > st.statement.const:
+            report.fail(
+                loc,
+                f"marked proved but {st.statement.a}-{st.statement.b}<= "
+                f"{d} does not imply <= {st.statement.const}",
+            )

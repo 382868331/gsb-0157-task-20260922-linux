@@ -42,8 +42,10 @@ class TestCheckerIndependence(unittest.TestCase):
                 imported.update(alias.name for alias in node.names)
         self.assertNotIn("interval_ai.transfer", imported)
         self.assertNotIn("interval_ai.engine", imported)
+        self.assertNotIn("interval_ai.dbm", imported)
         self.assertNotIn(".transfer", imported)
         self.assertNotIn(".engine", imported)
+        self.assertNotIn(".dbm", imported)
 
     def test_no_enumeration_calls(self) -> None:
         # 检查器源码里不得出现 range(...) 枚举/采样调用

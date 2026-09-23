@@ -24,11 +24,14 @@
 
 from .cfg import (
     MAX_BLOCKS,
+    MAX_DIFF_VARIABLES,
     MAX_VARIABLES,
+    AssertDiff,
     AssertRange,
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssumeDiff,
     Block,
     CFG,
     Guard,
@@ -39,10 +42,13 @@ from .checker import (
     check_local_soundness,
     check_transfer_step,
 )
+from .dbm import DiffState, ProductState
 from .engine import (
+    DEFAULT_RELATION_BUDGET,
     MAX_NARROWING_ROUNDS,
     AnalysisResult,
     AssertStatus,
+    DiffAssertStatus,
     analyze,
 )
 from .errors import BudgetExhaustedError, IntervalAIError, ValidationError
@@ -59,16 +65,23 @@ __all__ = [
     "AssignCopy",
     "AssignAdd",
     "AssertRange",
+    "AssumeDiff",
+    "AssertDiff",
     "MAX_VARIABLES",
     "MAX_BLOCKS",
+    "MAX_DIFF_VARIABLES",
     # domain
     "Interval",
     "AbstractState",
+    "DiffState",
+    "ProductState",
     # engine
     "analyze",
     "AnalysisResult",
     "AssertStatus",
+    "DiffAssertStatus",
     "MAX_NARROWING_ROUNDS",
+    "DEFAULT_RELATION_BUDGET",
     # transfer
     "transfer_statement",
     "transfer_block",

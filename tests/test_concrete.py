@@ -60,9 +60,58 @@ class TestConcreteCoverage(unittest.TestCase):
     def test_concrete_module_is_independent_of_core(self) -> None:
         import interval_ai.concrete as concrete_mod
 
-        for banned in ("interval_ai.engine", "interval_ai.transfer", "interval_ai.checker"):
+        for banned in (
+            "interval_ai.engine",
+            "interval_ai.transfer",
+            "interval_ai.checker",
+            "interval_ai.dbm",
+        ):
             self.assertNotIn(banned, concrete_mod.__dict__,
                              "具体参考不得直接依赖被测核心模块")
+
+    def test_assume_diff_cuts_concrete_path(self) -> None:
+        from interval_ai import (
+            AssumeDiff,
+            AssertDiff,
+            AssignConst,
+            Block,
+            CFG,
+        )
+
+        # x 入口 [0,2]：assume x-y<=0 且 y=1 后，仅 x<=1 的具体状态继续；
+        # x=2 的路径被剪掉；assert x-y<=0 在剩余状态全部成立。
+        cfg = CFG(
+            variables=("x", "y"),
+            blocks={
+                "s": Block(
+                    "s",
+                    (
+                        AssignConst("y", 1),
+                        AssumeDiff("x", "y", 0),
+                        AssertDiff("x", "y", 0),
+                    ),
+                    (),
+                ),
+            },
+            entry="s",
+        )
+        rep = run_bounded(cfg, [{"x": x, "y": 1} for x in range(3)])
+        self.assertFalse(rep.truncated)
+        self.assertEqual(rep.assert_violations, [])
+        # 到达块 s 入的仍有 3 个状态（裁剪发生在语句中），但全部 x <= 1
+        xs = sorted(s["x"] for s in rep.in_stores["s"])
+        self.assertEqual(xs, [0, 1, 2])  # 块入记录全部；断言在 assume 后求值
+
+    def test_assert_diff_violation_recorded(self) -> None:
+        from interval_ai import AssertDiff, Block, CFG
+
+        cfg = CFG(
+            variables=("x", "y"),
+            blocks={"b": Block("b", (AssertDiff("x", "y", 0),), ())},
+            entry="b",
+        )
+        rep = run_bounded(cfg, [{"x": 1, "y": 0}])  # 1 - 0 = 1 > 0
+        self.assertEqual(len(rep.assert_violations), 1)
 
 
 if __name__ == "__main__":

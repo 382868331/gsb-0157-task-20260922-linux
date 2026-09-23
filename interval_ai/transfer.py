@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 from .cfg import (
+    AssertDiff,
     AssertRange,
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssumeDiff,
     Block,
     Guard,
     Statement,
@@ -41,8 +43,10 @@ def transfer_statement(state: AbstractState, stmt: Statement) -> AbstractState:
         return state.assign(stmt.target, state.get(stmt.source))
     if isinstance(stmt, AssignAdd):
         return state.assign(stmt.target, state.get(stmt.source).add(stmt.const))
-    if isinstance(stmt, AssertRange):
-        return state  # 断言不改变状态
+    if isinstance(stmt, (AssertRange, AssumeDiff, AssertDiff)):
+        # 检查性语句不改变抽象状态；差分语句在纯区间视图下也只能跳过
+        # （关系结论由积引擎负责；见 engine._analyze_with_relations）。
+        return state
     raise TypeError(f"unsupported statement: {type(stmt).__name__}")  # pragma: no cover
 
 

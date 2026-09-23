@@ -14,7 +14,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .cfg import CFG, AssertRange, AssignAdd, AssignConst, AssignCopy, Block
+from .cfg import (
+    CFG,
+    AssertDiff,
+    AssertRange,
+    AssignAdd,
+    AssignConst,
+    AssignCopy,
+    AssumeDiff,
+    Block,
+)
 
 Store = dict[str, int]
 
@@ -47,11 +56,15 @@ def _exec_statement(store: Store, stmt) -> Store:
         nxt[stmt.target] = store[stmt.source]
     elif isinstance(stmt, AssignAdd):
         nxt[stmt.target] = store[stmt.source] + stmt.const
-    elif isinstance(stmt, AssertRange):
+    elif isinstance(stmt, (AssertRange, AssumeDiff, AssertDiff)):
         pass
     else:  # pragma: no cover - CFG 构造期保证
         raise TypeError(type(stmt).__name__)
     return nxt
+
+
+def _assume_diff_holds(store: Store, stmt: AssumeDiff) -> bool:
+    return store[stmt.a] - store[stmt.b] <= stmt.const
 
 
 def _guard_holds(store: Store, block: Block) -> bool:
@@ -99,6 +112,7 @@ def run_bounded(
 
         block = cfg.blocks[name]
         cur = store
+        cut_path = False
         for i, stmt in enumerate(block.statements):
             if isinstance(stmt, AssertRange):
                 x = cur[stmt.target]
@@ -106,9 +120,17 @@ def run_bounded(
                 hi_ok = stmt.upper is None or x <= stmt.upper
                 if not (lo_ok and hi_ok):
                     assert_violations.append((name, i, dict(cur)))
+            elif isinstance(stmt, AssertDiff):
+                if cur[stmt.a] - cur[stmt.b] > stmt.const:
+                    assert_violations.append((name, i, dict(cur)))
+            elif isinstance(stmt, AssumeDiff):
+                # 路径条件：不成立则该具体路径在此截断（不可达）
+                if not _assume_diff_holds(cur, stmt):
+                    cut_path = True
+                    break
             cur = _exec_statement(cur, stmt)
 
-        if not block.successors:
+        if cut_path or not block.successors:
             continue
         if block.guard is None:
             chosen = [(block.successors[0], cur)]

@@ -6,6 +6,12 @@
 * ``AssignCopy(target, source)``      -- target = source
 * ``AssignAdd(target, source, k)``    -- target = source + k（k 可为负整数）
 * ``AssertRange(target, lo, hi)``     -- 断言 lo <= target <= hi（不改变状态）
+* ``AssumeDiff(a, b, c)``             -- 假设 a - b <= c（精化状态；不可行则该路径不可达）
+* ``AssertDiff(a, b, c)``             -- 断言 a - b <= c（不改变状态；proved/unknown）
+
+差分约束语句把关系域（x-y<=c 的差界矩阵，见 :mod:`interval_ai.dbm`）接入分析，
+与逐变量区间构成归约积。含差分语句的 CFG 变量数至多
+:data:`MAX_DIFF_VARIABLES`（4）；纯区间程序仍允许至多 :data:`MAX_VARIABLES`（20）。
 
 分支由块尾 :class:`Guard` 表达：``Guard(x, "<=", c)`` 为真走 0 号后继，
 为假（整数上即 x >= c+1）走 1 号后继；``">="`` 同理（假支 x <= c-1）。
@@ -25,6 +31,8 @@ from .intervals import Interval
 
 MAX_VARIABLES = 20
 MAX_BLOCKS = 40
+# 关系（差分约束）域只在至多 4 个变量的程序上启用（题面限定）。
+MAX_DIFF_VARIABLES = 4
 VALID_OPS = ("<=", ">=")
 
 
@@ -89,7 +97,42 @@ class AssertRange:
             )
 
 
-Statement = AssignConst | AssignCopy | AssignAdd | AssertRange
+@dataclass(frozen=True, slots=True)
+class AssumeDiff:
+    """假设 ``a - b <= c``（c 为任意整数，可负）。
+
+    语义为路径条件：把约束并入关系域并做闭包；若与已有约束矛盾，则当前
+    路径不可达（后继状态为底），与守卫过滤掉整个整数补集一致。
+    两个操作数必须是**已声明的不同变量**（``x - x <= c`` 之类在构造期拒绝）。
+    """
+
+    a: str
+    b: str
+    const: int
+
+    def __post_init__(self) -> None:
+        require_int(self.const, "AssumeDiff.const")
+
+
+@dataclass(frozen=True, slots=True)
+class AssertDiff:
+    """断言 ``a - b <= c``；检查性语句，不改变抽象状态。
+
+    分析在该语句位置判定关系域是否符号蕴含该差界：蕴含为 ``proved``，
+    否则为 ``unknown``（无法证明不是错误，不抛异常）。
+    """
+
+    a: str
+    b: str
+    const: int
+
+    def __post_init__(self) -> None:
+        require_int(self.const, "AssertDiff.const")
+
+
+Statement = (
+    AssignConst | AssignCopy | AssignAdd | AssertRange | AssumeDiff | AssertDiff
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +216,19 @@ class CFG:
         if len(self.blocks) > MAX_BLOCKS:
             raise ValidationError(
                 f"too many blocks: {len(self.blocks)} > {MAX_BLOCKS}", "CFG.blocks"
+            )
+
+        # 先扫描语句类型：含差分约束的程序变量数上限为 MAX_DIFF_VARIABLES。
+        uses_diff_domain = any(
+            isinstance(block, Block)
+            and any(isinstance(st, (AssumeDiff, AssertDiff)) for st in block.statements)
+            for block in self.blocks.values()
+        )
+        if uses_diff_domain and len(variables) > MAX_DIFF_VARIABLES:
+            raise ValidationError(
+                f"programs with difference constraints allow at most "
+                f"{MAX_DIFF_VARIABLES} variables, got {len(variables)}",
+                "CFG.variables",
             )
         names: set[str] = set()
         for bname, block in self.blocks.items():
@@ -269,6 +325,25 @@ class CFG:
                 raise ValidationError(
                     f"target {st.target!r} is not declared", f"{loc}.target"
                 )
+        elif isinstance(st, (AssumeDiff, AssertDiff)):
+            kind = type(st).__name__
+            for operand_name, operand in (("a", st.a), ("b", st.b)):
+                if not isinstance(operand, str) or not operand:
+                    raise ValidationError(
+                        f"{kind}.{operand_name} must be a non-empty string, "
+                        f"got {operand!r}",
+                        f"{loc}.{operand_name}",
+                    )
+                if operand not in vset:
+                    raise ValidationError(
+                        f"{kind} operand {operand!r} is not declared",
+                        f"{loc}.{operand_name}",
+                    )
+            if st.a == st.b:
+                raise ValidationError(
+                    f"{kind} operands must be distinct variables, got {st.a!r} twice",
+                    f"{loc}.a",
+                )
         else:
             raise ValidationError(
                 f"unknown statement type {type(st).__name__}", loc
@@ -279,6 +354,15 @@ class CFG:
     @property
     def variable_tuple(self) -> tuple[str, ...]:
         return tuple(self.variables)
+
+    @property
+    def uses_diff_domain(self) -> bool:
+        """程序是否含差分约束语句（含则关系域启用、变量数 ≤ 4）。"""
+        return any(
+            isinstance(st, (AssumeDiff, AssertDiff))
+            for block in self.blocks.values()
+            for st in block.statements
+        )
 
     def initial_state_intervals(self) -> dict[str, Interval]:
         top = {v: Interval.top() for v in self.variables}
