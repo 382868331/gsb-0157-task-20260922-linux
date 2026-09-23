@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 from .cfg import (
+    AssertDiff,
+    AssumeDiff,
     AssertRange,
     AssignAdd,
     AssignConst,
@@ -43,6 +45,10 @@ def transfer_statement(state: AbstractState, stmt: Statement) -> AbstractState:
         return state.assign(stmt.target, state.get(stmt.source).add(stmt.const))
     if isinstance(stmt, AssertRange):
         return state  # 断言不改变状态
+    if isinstance(stmt, (AssumeDiff, AssertDiff)):
+        # 差分约束由关系域处理；纯区间视图下作空操作（仍是健全的过近似：
+        # 不会因此把可达路径判成不可达）。
+        return state
     raise TypeError(f"unsupported statement: {type(stmt).__name__}")  # pragma: no cover
 
 

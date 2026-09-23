@@ -14,7 +14,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .cfg import CFG, AssertRange, AssignAdd, AssignConst, AssignCopy, Block
+from .cfg import (
+    CFG,
+    AssertRange,
+    AssignAdd,
+    AssignConst,
+    AssignCopy,
+    AssumeDiff,
+    AssertDiff,
+    Block,
+)
 
 Store = dict[str, int]
 
@@ -30,6 +39,7 @@ class ConcreteReport:
     var_min: dict[str, dict[str, int]]
     var_max: dict[str, dict[str, int]]
     assert_violations: list[tuple[str, int, Store]]
+    diff_violations: list[tuple[str, int, Store]] = field(default_factory=list)
     truncated: bool = False
 
     def interval_observed(self, block: str, var: str) -> tuple[int, int] | None:
@@ -37,6 +47,13 @@ class ConcreteReport:
         if not vals or var not in vals:
             return None
         return vals[var], self.var_max[block][var]
+
+
+def _diff_holds(store: Store, stmt) -> bool:
+    """具体求值 ``left - right <= const``（任一端为 None 时取零）。"""
+    lv = 0 if stmt.left is None else store[stmt.left]
+    rv = 0 if stmt.right is None else store[stmt.right]
+    return lv - rv <= stmt.const
 
 
 def _exec_statement(store: Store, stmt) -> Store:
@@ -47,7 +64,7 @@ def _exec_statement(store: Store, stmt) -> Store:
         nxt[stmt.target] = store[stmt.source]
     elif isinstance(stmt, AssignAdd):
         nxt[stmt.target] = store[stmt.source] + stmt.const
-    elif isinstance(stmt, AssertRange):
+    elif isinstance(stmt, (AssertRange, AssumeDiff, AssertDiff)):
         pass
     else:  # pragma: no cover - CFG 构造期保证
         raise TypeError(type(stmt).__name__)
@@ -88,6 +105,7 @@ def run_bounded(
             frontier.append((cfg.entry, dict(st0)))
 
     assert_violations: list[tuple[str, int, Store]] = []
+    diff_violations: list[tuple[str, int, Store]] = []
     truncated = False
 
     while frontier:
@@ -99,6 +117,7 @@ def run_bounded(
 
         block = cfg.blocks[name]
         cur = store
+        feasible = True
         for i, stmt in enumerate(block.statements):
             if isinstance(stmt, AssertRange):
                 x = cur[stmt.target]
@@ -106,9 +125,17 @@ def run_bounded(
                 hi_ok = stmt.upper is None or x <= stmt.upper
                 if not (lo_ok and hi_ok):
                     assert_violations.append((name, i, dict(cur)))
+            elif isinstance(stmt, AssertDiff):
+                if not _diff_holds(cur, stmt):
+                    diff_violations.append((name, i, dict(cur)))
+            elif isinstance(stmt, AssumeDiff):
+                if not _diff_holds(cur, stmt):
+                    # 假设不成立：该具体路径在此不可行，不再执行后继语句/边
+                    feasible = False
+                    break
             cur = _exec_statement(cur, stmt)
 
-        if not block.successors:
+        if not feasible or not block.successors:
             continue
         if block.guard is None:
             chosen = [(block.successors[0], cur)]
@@ -136,5 +163,6 @@ def run_bounded(
         var_min=var_min,
         var_max=var_max,
         assert_violations=assert_violations,
+        diff_violations=diff_violations,
         truncated=truncated,
     )

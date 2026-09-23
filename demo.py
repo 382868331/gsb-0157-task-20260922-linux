@@ -1,4 +1,4 @@
-"""固定输入演示：整数循环的区间抽象解释。
+"""固定输入演示：整数循环的区间抽象解释 + 差分约束关系域。
 
 运行：``python demo.py``（Python 3.14，仅标准库；无网络、无 sleep、无预录结果）。
 
@@ -7,12 +7,17 @@
 2. 无界增长循环：同一点位断言只能给出 unknown（不是错误）；
 3. 独立符号包含性检查器复核结果；
 4. 独立具体执行器对有界程序做覆盖性对照；
-5. 真实触发的拒绝边界：bool 常量被 ValidationError 拒绝（可定位错误）。
+5. 新增 x-y<=c 差分约束：赋值、分支合流、循环入口三处与区间交换信息，
+   证明区间单独无法表达的变量差值关系；并展示未在迭代预算内收敛时
+   差分断言明确返回 unknown（不冒充证明）；
+6. 真实触发的拒绝边界：bool 常量与超规模差分组分别被 ValidationError 拒绝。
 """
 
 from __future__ import annotations
 
 from interval_ai import (
+    AssertDiff,
+    AssumeDiff,
     AssertRange,
     AssignAdd,
     AssignConst,
@@ -63,6 +68,53 @@ def unbounded_loop() -> CFG:
     )
 
 
+def diff_loop() -> CFG:
+    # x = 0; y = 1;
+    # while (x <= 4) { assert y - x <= 1; assert x - y <= -1; x++; y++ }
+    # assert y - x <= 1（循环出口仍成立）；区间无法单独推出任何跨变量界。
+    return CFG(
+        variables=("x", "y"),
+        blocks={
+            "init": Block(
+                "init", (AssignConst("x", 0), AssignConst("y", 1)), ("head",)
+            ),
+            "head": Block("head", (), ("body", "exit"), Guard("x", "<=", 4)),
+            "body": Block(
+                "body",
+                (
+                    AssertDiff("y", "x", 1),
+                    AssertDiff("x", "y", -1),
+                    AssignAdd("x", "x", 1),
+                    AssignAdd("y", "y", 1),
+                ),
+                ("head",),
+            ),
+            "exit": Block("exit", (AssertDiff("y", "x", 1),), ()),
+        },
+        entry="init",
+    )
+
+
+def diff_merge() -> CFG:
+    # x = 0; if (j >= 0) { y = 0 } else { y = 1 }; 合流后 x - y <= 0。
+    # 区间合流只得到 y in [0,1]；两支的 DBM 界（0 与 -1）合流为 0。
+    return CFG(
+        variables=("x", "y", "j"),
+        blocks={
+            "s": Block("s", (AssignConst("x", 0),), ("g",)),
+            "g": Block("g", (), ("a", "b"), Guard("j", ">=", 0)),
+            "a": Block("a", (AssignConst("y", 0),), ("m",)),
+            "b": Block("b", (AssignConst("y", 1),), ("m",)),
+            "m": Block(
+                "m",
+                (AssertRange("y", 0, 1), AssertDiff("x", "y", 0)),
+                (),
+            ),
+        },
+        entry="s",
+    )
+
+
 def print_result(title: str, result) -> None:
     print(f"--- {title}")
     print(f"加宽点: {list(result.widen_points)}；"
@@ -78,6 +130,14 @@ def print_result(title: str, result) -> None:
         print(
             f"  assert {a.statement.target} in [{req_lo}, {req_hi}] "
             f"观测={observed} -> {a.verdict.upper()}{extra}"
+        )
+    for a in getattr(result, "diff_asserts", []):
+        rv = "0" if a.statement.right is None else a.statement.right
+        bound = "(不可达)" if a.observed_bound is None else f"{a.observed_bound}"
+        extra = "（不可达位置，空真）" if a.vacuous else ""
+        print(
+            f"  assert {a.statement.left} - {rv} <= {a.statement.const} "
+            f"最紧上界={bound} -> {a.verdict.upper()}{extra}"
         )
 
 
@@ -113,7 +173,38 @@ def main() -> None:
     print(f"独立检查器复核：{'通过' if check_local_soundness(unb).ok else '失败'}")
 
     print()
-    print("=== 4) 实际触发的拒绝边界（非法输入必须报错且可定位）===")
+    print("=== 4) 差分约束 x-y<=c：赋值/分支合流/循环入口与区间交换信息 ===")
+    dm = analyze(diff_merge())
+    print_result("x=0; if(j>=0){y=0}else{y=1}; assert x-y<=0", dm)
+    print("合流点 DBM（入状态）：", dm.diff_state_at("m").text())
+    print(f"独立检查器复核：{'通过' if check_local_soundness(dm).ok else '失败'}")
+
+    dl = analyze(diff_loop())
+    print()
+    print_result("x=0;y=1; while(x<=4){assert y-x<=1; assert x-y<=-1; x++;y++}", dl)
+    head_diff = dl.diff_state_at("head")
+    print("循环头 DBM 中跨变量界：",
+          f"y-x<={head_diff.bound_of('y', 'x')}；",
+          f"x-y<={head_diff.bound_of('x', 'y')}")
+    print("（区间视图只能给出 x:[0,5], y:[1,6]，无法表达上述差值不变量）")
+    concrete2 = run_bounded(diff_loop(), [{"x": 0, "y": 1}])
+    print(f"独立具体执行器：截断={concrete2.truncated}，"
+          f"差分断言违反数={len(concrete2.diff_violations)}，"
+          f"区间断言违反数={len(concrete2.assert_violations)}")
+    print(f"独立检查器复核：{'通过' if check_local_soundness(dl).ok else '失败'}")
+
+    print()
+    print("=== 5) 显式迭代预算内未收敛 -> 差分断言 unknown（不冒充证明）===")
+    fb = analyze(diff_loop(), loop_budget=1)
+    print(f"关系域收敛标记：{fb.relational_converged}（预算 {fb.relational_budget} 轮）")
+    for a in fb.diff_asserts:
+        print(f"  assert {a.statement.left}-{a.statement.right}<= {a.statement.const}"
+              f" -> {a.verdict.upper()}（已退回纯区间结果）")
+    print("区间结论仍有效：exit 处 x =", fb.block_in["exit"].get("x").text)
+    print(f"独立检查器复核：{'通过' if check_local_soundness(fb).ok else '失败'}")
+
+    print()
+    print("=== 6) 实际触发的拒绝边界（非法输入必须报错且可定位）===")
     try:
         # bool 是 int 的子类，但契约明确拒绝 bool 充当整数常量
         CFG(
@@ -126,6 +217,16 @@ def main() -> None:
     except IntervalAIError as exc:
         print(f"捕获 {type(exc).__name__}: {exc}")
         print("（非法输入被拒绝，未产生任何半成品对象）")
+
+    try:
+        # 差分约束限定至多 4 个变量：5 个变量 + AssumeDiff 必须被拒绝
+        CFG(
+            variables=tuple("abcde"),
+            blocks={"b": Block("b", (AssumeDiff("a", "b", 0),), ())},
+            entry="b",
+        )
+    except IntervalAIError as exc:
+        print(f"捕获 {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

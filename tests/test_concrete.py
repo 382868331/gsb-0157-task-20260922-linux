@@ -60,7 +60,13 @@ class TestConcreteCoverage(unittest.TestCase):
     def test_concrete_module_is_independent_of_core(self) -> None:
         import interval_ai.concrete as concrete_mod
 
-        for banned in ("interval_ai.engine", "interval_ai.transfer", "interval_ai.checker"):
+        for banned in (
+            "interval_ai.engine",
+            "interval_ai.transfer",
+            "interval_ai.checker",
+            "interval_ai.relational",
+            "interval_ai.diffs",
+        ):
             self.assertNotIn(banned, concrete_mod.__dict__,
                              "具体参考不得直接依赖被测核心模块")
 

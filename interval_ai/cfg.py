@@ -6,6 +6,12 @@
 * ``AssignCopy(target, source)``      -- target = source
 * ``AssignAdd(target, source, k)``    -- target = source + k（k 可为负整数）
 * ``AssertRange(target, lo, hi)``     -- 断言 lo <= target <= hi（不改变状态）
+* ``AssumeDiff(x, y, c)``             -- 假设 x - y <= c（y 传 ``None`` 表示零常数，
+  即可写 x <= c；不可满足时该路径不可达）
+* ``AssertDiff(x, y, c)``             -- 断言 x - y <= c，结论 proved/unknown
+
+差分约束只在**至多 4 个变量**的 CFG 中支持（含差分语句而变量数 > 4 时
+构造期抛 :class:`~interval_ai.errors.ValidationError`）。
 
 分支由块尾 :class:`Guard` 表达：``Guard(x, "<=", c)`` 为真走 0 号后继，
 为假（整数上即 x >= c+1）走 1 号后继；``">="`` 同理（假支 x <= c-1）。
@@ -25,6 +31,9 @@ from .intervals import Interval
 
 MAX_VARIABLES = 20
 MAX_BLOCKS = 40
+# 差分约束（DBM 关系域）仅在小规模程序上支持：变量（含零常数节点以外的
+# 程序变量）至多 4 个。
+MAX_DIFF_VARIABLES = 4
 VALID_OPS = ("<=", ">=")
 
 
@@ -90,6 +99,55 @@ class AssertRange:
 
 
 Statement = AssignConst | AssignCopy | AssignAdd | AssertRange
+
+
+@dataclass(frozen=True, slots=True)
+class _DiffBase:
+    """差分约束语句公共字段：``left - right <= const``。
+
+    ``right`` 为 ``None`` 时右端取零常数节点（``left <= const``）；
+    ``left`` 为 ``None`` 时左端取零常数节点（``-right <= const``，
+    即 ``right >= -const``）。二者不得同时为 ``None``，也不得指向同一变量。
+    """
+
+    left: str | None
+    right: str | None
+    const: int
+
+    def __post_init__(self) -> None:
+        require_int(self.const, f"{type(self).__name__}.const")
+        if self.left is None and self.right is None:
+            raise ValidationError(
+                "difference constraint needs at least one variable "
+                "(left=None and right=None is the trivial zero node)",
+                f"{type(self).__name__}.left",
+            )
+        if self.left is not None and self.left == self.right:
+            # x - x <= c 与 c 取值要么平凡要么矛盾；作为语句没有信息量，
+            # 显式拒绝而非静默忽略，避免调用方误以为约束在起作用。
+            raise ValidationError(
+                f"difference constraint {self.left} - {self.right} must use "
+                f"two distinct variables (or a None side for the zero node)",
+                f"{type(self).__name__}.right",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class AssumeDiff(_DiffBase):
+    """假设约束 ``left - right <= const`` 成立（不可满足则该路径不可达）。
+
+    例如 ``x <= y + 3`` 写作 ``AssumeDiff("x", "y", 3)``；
+    ``z <= -2`` 写作 ``AssumeDiff("z", None, -2)``；
+    ``z >= 2``（即 ``0 - z <= -2``）写作 ``AssumeDiff(None, "z", -2)``。
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class AssertDiff(_DiffBase):
+    """断言 ``left - right <= const``；不改变状态，结论 proved/unknown。"""
+
+
+Statement = AssignConst | AssignCopy | AssignAdd | AssertRange | AssumeDiff | AssertDiff
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +223,6 @@ class CFG:
             seen.add(v)
         vset = set(variables)
         object.__setattr__(self, "variables", variables)
-
         if not isinstance(self.blocks, Mapping):
             raise ValidationError("blocks must be a mapping name -> Block", "CFG.blocks")
         if not self.blocks:
@@ -175,6 +232,7 @@ class CFG:
                 f"too many blocks: {len(self.blocks)} > {MAX_BLOCKS}", "CFG.blocks"
             )
         names: set[str] = set()
+        uses_diff = False
         for bname, block in self.blocks.items():
             bloc = f"block {bname!r}"
             if not isinstance(block, Block):
@@ -189,6 +247,8 @@ class CFG:
                 raise ValidationError(f"duplicate block name {bname!r}", "CFG.blocks")
             names.add(bname)
             for i, st in enumerate(block.statements):
+                if isinstance(st, (AssumeDiff, AssertDiff)):
+                    uses_diff = True
                 self._validate_statement(st, f"{bloc}.stmts[{i}]", vset)
             if block.guard is not None:
                 g = block.guard
@@ -220,6 +280,13 @@ class CFG:
                         f"successor {s!r} does not exist", f"{bloc}.successors[{j}]"
                     )
 
+        if uses_diff and len(variables) > MAX_DIFF_VARIABLES:
+            raise ValidationError(
+                f"difference constraints (AssumeDiff/AssertDiff) require at most "
+                f"{MAX_DIFF_VARIABLES} variables, got {len(variables)}",
+                "CFG.variables",
+            )
+
         _check_name(self.entry, "CFG.entry", "entry name")
         if self.entry not in self.blocks:
             raise ValidationError(
@@ -241,6 +308,30 @@ class CFG:
         object.__setattr__(self, "entry_bounds", bounds)
 
     def _validate_statement(self, st: object, loc: str, vset: set[str]) -> None:
+        if isinstance(st, (AssumeDiff, AssertDiff)):
+            if st.left is not None:
+                if not isinstance(st.left, str) or not st.left:
+                    raise ValidationError(
+                        f"{type(st).__name__}.left must be a variable name or None "
+                        f"(zero node)",
+                        f"{loc}.left",
+                    )
+                if st.left not in vset:
+                    raise ValidationError(
+                        f"left variable {st.left!r} is not declared", f"{loc}.left"
+                    )
+            if st.right is not None:
+                if not isinstance(st.right, str) or not st.right:
+                    raise ValidationError(
+                        f"{type(st).__name__}.right must be a variable name or None "
+                        f"(zero node)",
+                        f"{loc}.right",
+                    )
+                if st.right not in vset:
+                    raise ValidationError(
+                        f"right variable {st.right!r} is not declared", f"{loc}.right"
+                    )
+            return
         if isinstance(st, AssignConst):
             if st.target not in vset:
                 raise ValidationError(
