@@ -16,11 +16,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .cfg import CFG, AssertRange, Block
 from .errors import BudgetExhaustedError
 from .intervals import AbstractState, Interval
 from .transfer import edge_state, transfer_block, transfer_statement
+
+if TYPE_CHECKING:  # 避免循环导入：partition 依赖本模块的图分析辅助
+    from .partition import MergeEvent, Partition
 
 MAX_NARROWING_ROUNDS = 8
 DEFAULT_ASCENDING_BUDGET = 10000
@@ -119,6 +123,8 @@ class AssertStatus:
     verdict: str  # "proved" | "unknown"
     observed: Interval | None  # 分析到的实际区间；不可达位置为 None
     vacuous: bool = False  # 位置不可达，空真成立
+    # 分区模式下每个可达分区的 (标签文本, 判定)；非分区分析为空
+    partition_verdicts: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -134,6 +140,11 @@ class AssertStatus:
         else:
             d["observed"] = self.observed.to_dict()
             d["vacuous"] = self.vacuous
+        if self.partition_verdicts:
+            d["partitions"] = [
+                {"label": label, "verdict": v}
+                for label, v in self.partition_verdicts
+            ]
         return d
 
 
@@ -149,6 +160,12 @@ class AnalysisResult:
     # 收窄前（上升迭代刚稳定时）的快照，用于验证收窄确实带来了改善
     post_widening_in: dict[str, AbstractState] = field(default_factory=dict)
     post_widening_out: dict[str, AbstractState] = field(default_factory=dict)
+    # -- 有限路径分区模式（partition_points 非空时由 partition.py 填充）---------
+    partition_points: tuple[str, ...] = ()
+    max_partitions: int | None = None
+    merges: tuple[MergeEvent, ...] = ()  # 强制合并发生处（块/阶段/被并标签）
+    block_partitions_in: dict[str, tuple[Partition, ...]] = field(default_factory=dict)
+    block_partitions_out: dict[str, tuple[Partition, ...]] = field(default_factory=dict)
 
     @property
     def narrowing_refined(self) -> bool:
@@ -158,7 +175,7 @@ class AnalysisResult:
         return self.block_in[block]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             "entry": self.cfg.entry,
             "widen_points": list(self.widen_points),
             "ascending_rounds": self.ascending_rounds,
@@ -172,6 +189,15 @@ class AnalysisResult:
             },
             "asserts": [a.to_dict() for a in self.asserts],
         }
+        if self.partition_points:
+            d["partition_points"] = list(self.partition_points)
+            d["max_partitions"] = self.max_partitions
+            d["merges"] = [m.to_dict() for m in self.merges]
+            d["partitions_in"] = {
+                name: [p.to_dict() for p in parts]
+                for name, parts in self.block_partitions_in.items()
+            }
+        return d
 
 
 # -- 引擎 ---------------------------------------------------------------------
@@ -198,12 +224,34 @@ def _join_inputs(
     return acc
 
 
-def analyze(cfg: CFG, *, ascending_budget: int = DEFAULT_ASCENDING_BUDGET) -> AnalysisResult:
-    """对 ``cfg`` 运行区间抽象解释，返回每块入/出不变量与断言结论。"""
+def analyze(
+    cfg: CFG,
+    *,
+    ascending_budget: int = DEFAULT_ASCENDING_BUDGET,
+    partition_points: tuple[str, ...] | list[str] = (),
+    max_partitions: int | None = None,
+) -> AnalysisResult:
+    """对 ``cfg`` 运行区间抽象解释，返回每块入/出不变量与断言结论。
+
+    :param partition_points: 可选的有限路径分区位置（至多 3 个带守卫的块名；
+        见 :mod:`interval_ai.partition`）。为空即旧行为：合并一律取凸包。
+    :param max_partitions: 每个块允许的最大分区数（显式上限，默认
+        ``DEFAULT_MAX_PARTITIONS``）；超出按标签序合并，不删状态。
+    """
     if isinstance(ascending_budget, bool) or not isinstance(ascending_budget, int):
         raise TypeError("ascending_budget must be int")
     if ascending_budget < 1:
         raise ValueError("ascending_budget must be >= 1")
+
+    if partition_points:
+        from .partition import DEFAULT_MAX_PARTITIONS, analyze_partitioned
+
+        return analyze_partitioned(
+            cfg,
+            partition_points,
+            DEFAULT_MAX_PARTITIONS if max_partitions is None else max_partitions,
+            ascending_budget=ascending_budget,
+        )
 
     order, widen_points = _reverse_postorder(cfg)
     back_edges, _ = _dfs_back_edges_and_order(cfg)

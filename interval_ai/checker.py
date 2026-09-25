@@ -15,6 +15,10 @@
 2. 边守卫：``filter_guard(block_out, edge)`` 必须被后继块的 ``block_in`` 包含。
 3. 入口：声明的入口初始区间必须被入口 ``block_in`` 包含。
 4. 断言：``proved`` 的断言，其观测区间必须符号包含于要求区间。
+5. 有限路径分区模式（结果带 ``partition_points`` 时）：逐分区重复上述
+   块转移/边守卫包含（边标签在此独立重写），并逐分区独立重算断言观测，
+   只有每个可达分区都被证明时才允许 ``proved``——即"分区转移包含性 +
+   循环后不动点"的复核，不做任何采样。
 """
 
 from __future__ import annotations
@@ -152,6 +156,23 @@ def _ref_state_subseteq(a, b) -> bool:
     return all(_ref_iv_subseteq(a[v], b[v]) for v in a)
 
 
+def _ref_state_join(a, b):
+    """参考状态凸包（逐变量区间凸包）。"""
+    if a is _BOTTOM:
+        return b
+    if b is _BOTTOM:
+        return a
+    return {v: _ref_join_iv(a[v], b[v]) for v in a}
+
+
+def _ref_hull(envs) -> object:
+    """若干参考状态的凸包；空集合为底。"""
+    acc = _BOTTOM
+    for env in envs:
+        acc = _ref_state_join(acc, env)
+    return acc
+
+
 # -- 报告 ----------------------------------------------------------------------
 
 @dataclass(slots=True)
@@ -244,18 +265,22 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
             report.fail(f"{bloc}.out", "block-in is bottom but block-out is not")
 
         # 4) 每条边：守卫过滤后 ⊆ 后继入
-        for i, succ in enumerate(block.successors):
-            if block.guard is None:
-                edge_env = _from_abstract(out_s)
-            else:
-                edge_env = _ref_filter_guard(_from_abstract(out_s), block.guard, i == 0)
-            succ_in = _from_abstract(result.block_in[succ])
-            if not _ref_state_subseteq(edge_env, succ_in):
-                side = "true" if i == 0 else "false"
-                report.fail(
-                    f"{bloc}.successors[{i}]({side}) -> {succ!r}",
-                    "edge state not contained in successor block-in",
-                )
+        # 分区模式下跳过凸包视图的本检查：对凸包整体做守卫过滤比"逐分区过滤
+        # 再取凸包"粗（区间交不分配于凸包），相关精度正是分区要保留的；
+        # 分区结果的边包含性由下面第 6 组逐分区检查承担。
+        if not getattr(result, "partition_points", ()):
+            for i, succ in enumerate(block.successors):
+                if block.guard is None:
+                    edge_env = _from_abstract(out_s)
+                else:
+                    edge_env = _ref_filter_guard(_from_abstract(out_s), block.guard, i == 0)
+                succ_in = _from_abstract(result.block_in[succ])
+                if not _ref_state_subseteq(edge_env, succ_in):
+                    side = "true" if i == 0 else "false"
+                    report.fail(
+                        f"{bloc}.successors[{i}]({side}) -> {succ!r}",
+                        "edge state not contained in successor block-in",
+                    )
 
     # 5) 断言结论的独立复核
     for st in result.asserts:
@@ -271,4 +296,117 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
                     loc,
                     f"marked proved but observed {observed} not contained in {required}",
                 )
+
+    # 6) 有限路径分区模式：逐分区转移包含性 + 逐分区断言复核
+    if getattr(result, "partition_points", ()):
+        _check_partitions(result, cfg, report)
     return report
+
+
+# -- 分区结果的独立复核（不导入 partition.py，标签语义在此重写） -------------------
+
+
+def _partition_label_text(label) -> str:
+    return "merged" if label is None else "".join(label)
+
+
+def _check_partitions(result, cfg: CFG, report: CheckReport) -> None:
+    """对分区模式结果做独立的逐分区符号包含性检查。
+
+    * 每个分区的块内语句转移：参考精确像 == 核心分区出状态；
+    * 每条守卫边：源分区的过滤像必须包含于"标签被重写后"对应的目标分区
+      （该标签已被合并时，必须包含于 merged 分区或全部分区的凸包）；
+    * 每条断言：独立重算每个可达分区的观测区间，只有全部包含于要求区间
+      时才允许 ``proved``；``vacuous`` 标志必须与"无可达分区"一致。
+    """
+    pts = result.partition_points
+    pos = {name: i for i, name in enumerate(pts)}
+    pins = {
+        n: {p.label: p.state for p in result.block_partitions_in.get(n, ())}
+        for n in cfg.blocks
+    }
+    pouts = {
+        n: {p.label: p.state for p in result.block_partitions_out.get(n, ())}
+        for n in cfg.blocks
+    }
+
+    for name, block in cfg.blocks.items():
+        bloc = f"block {name!r}"
+        # 1) 逐分区块内转移精确性
+        for label, st in pins[name].items():
+            ploc = f"{bloc}.partition[{_partition_label_text(label)}]"
+            ref_out = _ref_transfer_block(st, block)
+            core_state = pouts[name].get(label)
+            core_out = _from_abstract(core_state) if core_state is not None else _BOTTOM
+            if not _ref_state_subseteq(ref_out, core_out):
+                report.fail(
+                    f"{ploc}.out",
+                    "core partition-out does not contain reference image (unsound)",
+                )
+            if not _ref_state_subseteq(core_out, ref_out):
+                report.fail(
+                    f"{ploc}.out",
+                    "core partition-out is strictly coarser than reference image",
+                )
+        # 2) 逐分区、逐边：过滤像 ⊆ 标签重写后的目标分区（或 merged/凸包）
+        for i, succ in enumerate(block.successors):
+            for label, st in pouts[name].items():
+                env = _from_abstract(st)
+                if block.guard is None:
+                    edge_env = env
+                else:
+                    edge_env = _ref_filter_guard(env, block.guard, i == 0)
+                expected = label
+                if expected is not None and name in pos:
+                    rewritten = list(expected)
+                    rewritten[pos[name]] = "T" if i == 0 else "F"
+                    expected = tuple(rewritten)
+                targets = pins[succ]
+                if expected in targets:
+                    ok = _ref_state_subseteq(edge_env, _from_abstract(targets[expected]))
+                elif None in targets:
+                    ok = _ref_state_subseteq(edge_env, _from_abstract(targets[None]))
+                else:
+                    hull = _ref_hull([_from_abstract(t) for t in targets.values()])
+                    ok = _ref_state_subseteq(edge_env, hull)
+                if not ok:
+                    side = "true" if i == 0 else "false"
+                    report.fail(
+                        f"{bloc}.partition[{_partition_label_text(label)}]"
+                        f".successors[{i}]({side}) -> {succ!r}",
+                        "edge partition state not contained in successor partition",
+                    )
+
+    # 3) 逐分区断言复核：proved 当且仅当每个可达分区都被独立证明
+    for st in result.asserts:
+        loc = f"block {st.block!r}.assert[{st.index}]"
+        block = cfg.blocks[st.block]
+        required: Bound = (st.statement.lower, st.statement.upper)
+        reachable = []
+        for label, pst in pins[st.block].items():
+            env = _from_abstract(pst)
+            for j, stmt in enumerate(block.statements):
+                if j >= st.index:
+                    break
+                env = _ref_transfer_stmt(env, stmt)
+            if env is not _BOTTOM:
+                reachable.append((label, env))
+        bad = [
+            label
+            for label, env in reachable
+            if not _ref_iv_subseteq(env[st.statement.target], required)
+        ]
+        expected = "unknown" if bad else "proved"
+        if st.verdict != expected:
+            report.fail(
+                loc,
+                f"verdict {st.verdict!r} contradicts independent per-partition "
+                f"recheck ({expected!r}); unprovable partitions: "
+                f"{[_partition_label_text(l) for l in bad]}",
+            )
+        if st.vacuous != (not reachable):
+            report.fail(
+                loc,
+                f"vacuous={st.vacuous} but reachable partition count is "
+                f"{len(reachable)}",
+            )

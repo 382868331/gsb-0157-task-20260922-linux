@@ -4,7 +4,11 @@
 （CFG，变量为数学整数），输出每个基本块的入/出区间不变量、循环加宽/收窄
 迭代过程，并对范围断言给出 `proved` / `unknown` 结论。另含一个**独立**的
 局部转移包含性检查器（符号端点证明，不做有限采样）和一个**独立**的确定性
-具体执行器（仅用于有界程序的覆盖性对照）。
+具体执行器（仅用于有界程序的覆盖性对照/找反例）。
+
+可选的**有限路径分区模式**：调用方指定至多 3 个条件位置，状态按这些位置
+最近一次真/假结果分组（未经过标 `?`），缓解 `if` 合流时凸包丢失分支信息
+的问题；分区数有显式上限，超出按标签序合并（丢失标签取凸包，不删状态）。
 
 ## 运行环境
 
@@ -31,6 +35,8 @@ python demo.py
 | 块尾条件 | `x <= c`、`x >= c`；真支走第 0 个后继，假支（整数补集）走第 1 个后继 |
 | 后继数 | 0（终止块）、1（无条件）、2（必须带守卫） |
 | 数值域 | 数学整数（Python 任意精度 `int`），无溢出、无除法/乘法/函数调用 |
+| 分区位置 | 可选，0–**3** 个带守卫的块（`partition_points`） |
+| 分区数上限 | 每块 ≤ `max_partitions`（默认 8），超限按标签序合并 |
 
 守卫的整数补集：`x <= c` 为假 ⇔ `x >= c+1`；`x >= c` 为假 ⇔ `x <= c-1`。
 
@@ -45,6 +51,8 @@ from interval_ai import (
     Interval, AbstractState,
     # 分析
     analyze, AnalysisResult, AssertStatus, MAX_NARROWING_ROUNDS,
+    # 有限路径分区
+    Partition, MergeEvent, MAX_PARTITION_POINTS, DEFAULT_MAX_PARTITIONS,
     # 局部转移（也可单独复用）
     transfer_statement, transfer_block, edge_state, guard_interval,
     # 独立检查器
@@ -79,6 +87,41 @@ from interval_ai import (
   仅对有界程序完备，状态超预算时 `truncated=True`（明确标记、不冒充证明）。
 
 完整机读结果可用 `result.to_dict()`。
+
+## 可选：有限路径分区模式
+
+```python
+result = analyze(cfg, partition_points=("sw1",), max_partitions=4)
+```
+
+- `partition_points`：至多 **3** 个（`MAX_PARTITION_POINTS`）带守卫的块名；
+  缺省为空，即旧行为（合并一律取凸包），结果与未分区完全一致。
+- **标签**：长度 = 分区位置数的元组，逐位为 `"T"`（最近一次经过该位置
+  为真）、`"F"`（为假）、`"?"`（尚未经过，unknown）。标签沿边**重写**：
+  循环再次经过指定条件时用新结果覆盖旧值，旧真/假不会被永久固定成
+  路径事实。
+- **数值域不变**：每个分区仍是原来的逐变量区间状态，不引入关系域；
+  每个 `(块, 标签)` 独立做延迟加宽（前两次凸包、第三次起 widening）
+  与至多 8 轮收窄。
+- `max_partitions`：每个块允许的最大分区数（显式上限，默认
+  `DEFAULT_MAX_PARTITIONS = 8`）。超限时**按标签序合并**：保留最小的
+  `max_partitions - 1` 个具体标签，其余并入一个丢失标签的 merged
+  分区（区间凸包），**不删除任何状态**；被合并的标签在该块不再重新
+  分裂（保证终止）。每次合并记录为 `MergeEvent`（块/阶段/轮次/被并
+  标签），见 `result.merges`——合并发生处可定位。
+- **断言判定**：只有**每个**可达分区都被符号包含证明时才判 `proved`；
+  逐分区结论见 `AssertStatus.partition_verdicts`。无可达分区时与旧
+  语义一样空真 `proved`（`vacuous=True`）。
+- 结果新增字段：`partition_points`、`max_partitions`、`merges`、
+  `block_partitions_in` / `block_partitions_out`（`Partition(label,
+  state)` 元组，`label=None` 即 merged 分区）；`block_in` / `block_out`
+  仍是各分区的凸包视图，旧接口不受影响。
+- 证明仍由**分区转移包含性**（`check_local_soundness` 逐分区独立复核
+  块转移、守卫边与断言）与**循环后不动点**检查支持；独立有限执行
+  （`run_bounded`）只能用于找反例，不能用采样代替证明。
+- 非法分区参数抛可定位的 `ValidationError`：超过 3 个位置、重复、
+  未知块、无守卫的块、`max_partitions` 非正整数或 bool。
+
 
 ## 分析算法（设计取舍）
 
@@ -119,7 +162,7 @@ from interval_ai import (
 
 ## demo 会真实展示什么
 
-`python demo.py` 固定构造两个程序并真实求解：
+`python demo.py` 固定构造若干程序并真实求解：
 
 1. 有界循环 `i=0; while(i<=4){assert 0<=i<=4; i++}; assert i==5`：
    每块入/出不变量、两条断言 **PROVED**，以及收窄改善
@@ -127,18 +170,27 @@ from interval_ai import (
    body 块具体值域 [0,4] 并确认被抽象区间覆盖。
 2. 无界增长循环 `i=0; while(i>=0){assert i<=5; i++}`：循环头
    `[0,+inf)`、退出支不可达（bottom），断言输出 **UNKNOWN**（非错误）。
-3. 真实触发一个拒绝边界：`AssignConst("i", True)` 抛带定位的
+3. 有限路径分区：`if (y>=0) x=1 else x=2; if (y>=0) assert x<=1 else
+   assert x>=2`——凸包模式两条断言 UNKNOWN，以第一个 `if` 为分区位置
+   后两条均 **PROVED**（T/F 分区各自记住 y 的符号，"走错支"的分区被
+   第二个守卫过滤成底）。
+4. 强制合并：三个顺序条件位置（2^3=8 种标签组合）在 `max_partitions=2`
+   下触发合并，打印每次合并的发生处与被并标签，断言仍全部 PROVED。
+5. 真实触发一个拒绝边界：`AssignConst("i", True)` 抛带定位的
    `ValidationError`。
 
 ## 已知限制
 
 - 非关系型区间域：无法推导变量间关系（如 `y = x` 后 `x <= y` 之外的
-  关联），存在固有精度损失，部分真命题只能得到 `unknown`。
-- 合并一律取凸包：`x=0` 与 `x=10` 合并为 `[0,10]`，不含析取/路径分裂。
+  关联），存在固有精度损失，部分真命题只能得到 `unknown`。分区模式只
+  按指定条件的最近真/假分组，不引入关系数值域，不能代替关系域。
+- 缺省（未启用分区）时合并一律取凸包：`x=0` 与 `x=10` 合并为 `[0,10]`；
+  分区模式也只保留至多 3 个指定位置、每块至多 `max_partitions` 个分区，
+  超限即丢失标签退回凸包。
 - 仅支持四种语句与两种守卫；入口不可达块（从 entry 不可达）保持 bottom，
   不参与分析。
-- 具体执行器仅适合有界小程序对照；对无界循环会在状态预算处截断并显式
-  标记 `truncated=True`，无界情形的健全性由符号检查器承担。
+- 具体执行器仅适合有界小程序对照/找反例；对无界循环会在状态预算处截断
+  并显式标记 `truncated=True`，无界情形的健全性由符号检查器承担。
 - 加宽阈值（前两次 join）与收窄上限（8 轮）按题面固定，未做阈值自适应。
 
 ## 目录
@@ -150,8 +202,9 @@ interval_ai/
   cfg.py       CFG/Block/Guard/语句 数据结构与构造期校验
   transfer.py  局部抽象转移（语句、守卫边过滤）
   engine.py    RPO 不动点引擎：延迟加宽 + 至多 8 轮收窄
-  checker.py   独立符号包含性检查器（不采样、不依赖核心）
-  concrete.py  独立确定性具体执行器（有界程序对照）
-tests/         60 个 unittest 用例（域/引擎/检查器/错误语义/具体覆盖）
+  partition.py 可选有限路径分区：标签分组、超上限按标签序合并
+  checker.py   独立符号包含性检查器（不采样、不依赖核心；逐分区复核）
+  concrete.py  独立确定性具体执行器（有界程序对照/找反例）
+tests/         98 个 unittest 用例（域/引擎/分区/检查器/错误语义/具体覆盖）
 demo.py        固定输入演示
 ```

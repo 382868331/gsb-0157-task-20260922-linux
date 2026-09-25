@@ -5,9 +5,11 @@
 演示内容：
 1. 有界循环：每块入/出不变量、断言 proved、收窄改善（[n+1,+inf) -> [n+1,n+1]）；
 2. 无界增长循环：同一点位断言只能给出 unknown（不是错误）；
-3. 独立符号包含性检查器复核结果；
-4. 独立具体执行器对有界程序做覆盖性对照；
-5. 真实触发的拒绝边界：bool 常量被 ValidationError 拒绝（可定位错误）。
+3. 有限路径分区：两分支分别设置不同区间后再判断——凸包模式 unknown，
+   分区模式 proved；以及分区数超上限时的强制合并（记录发生处）；
+4. 独立符号包含性检查器复核结果；
+5. 独立具体执行器对有界程序做覆盖性对照（仅用于找反例）；
+6. 真实触发的拒绝边界：bool 常量被 ValidationError 拒绝（可定位错误）。
 """
 
 from __future__ import annotations
@@ -63,6 +65,42 @@ def unbounded_loop() -> CFG:
     )
 
 
+def correlated_branches() -> CFG:
+    # if (y >= 0) x = 1 else x = 2;  if (y >= 0) assert x<=1 else assert x>=2
+    return CFG(
+        variables=("x", "y"),
+        blocks={
+            "sw1": Block("sw1", (), ("t1", "f1"), Guard("y", ">=", 0)),
+            "t1": Block("t1", (AssignConst("x", 1),), ("sw2",)),
+            "f1": Block("f1", (AssignConst("x", 2),), ("sw2",)),
+            "sw2": Block("sw2", (), ("t2", "f2"), Guard("y", ">=", 0)),
+            "t2": Block("t2", (AssertRange("x", None, 1),), ()),
+            "f2": Block("f2", (AssertRange("x", 2, None),), ()),
+        },
+        entry="sw1",
+    )
+
+
+def merge_pressure() -> CFG:
+    # 三个顺序条件位置（2^3=8 种标签组合），演示 max_partitions 强制合并
+    return CFG(
+        variables=("a", "b", "c", "x", "y", "z"),
+        blocks={
+            "s1": Block("s1", (), ("t1", "f1"), Guard("a", ">=", 0)),
+            "t1": Block("t1", (AssignConst("x", 1),), ("s2",)),
+            "f1": Block("f1", (AssignConst("x", 2),), ("s2",)),
+            "s2": Block("s2", (), ("t2", "f2"), Guard("b", ">=", 0)),
+            "t2": Block("t2", (AssignConst("y", 1),), ("s3",)),
+            "f2": Block("f2", (AssignConst("y", 2),), ("s3",)),
+            "s3": Block("s3", (), ("t3", "f3"), Guard("c", ">=", 0)),
+            "t3": Block("t3", (AssignConst("z", 1),), ("end",)),
+            "f3": Block("f3", (AssignConst("z", 2),), ("end",)),
+            "end": Block("end", (AssertRange("x", 1, 2), AssertRange("z", 1, 2)), ()),
+        },
+        entry="s1",
+    )
+
+
 def print_result(title: str, result) -> None:
     print(f"--- {title}")
     print(f"加宽点: {list(result.widen_points)}；"
@@ -113,7 +151,44 @@ def main() -> None:
     print(f"独立检查器复核：{'通过' if check_local_soundness(unb).ok else '失败'}")
 
     print()
-    print("=== 4) 实际触发的拒绝边界（非法输入必须报错且可定位）===")
+    print("=== 4) 有限路径分区：两分支分别设置不同区间后再判断 ===")
+    corr = correlated_branches()
+    plain = analyze(corr)
+    print("凸包模式（旧行为）：x 合流为 [1,2]，与 y 的相关性丢失：")
+    for a in plain.asserts:
+        print(f"  block {a.block}: assert x in "
+              f"[{a.statement.lower}, {a.statement.upper}] -> {a.verdict.upper()}")
+    part = analyze(corr, partition_points=("sw1",), max_partitions=4)
+    print("分区模式（partition_points=('sw1',)，按 sw1 最近一次真/假分组）：")
+    for name in ("sw2", "t2", "f2"):
+        for p in part.block_partitions_in[name]:
+            print(f"  {name:4} 分区 {p.label_text:3}  {p.state.text}")
+    for a in part.asserts:
+        per = ", ".join(f"{l}:{v}" for l, v in a.partition_verdicts)
+        print(f"  block {a.block}: 逐分区 [{per}] -> {a.verdict.upper()}")
+    print(f"独立检查器复核（逐分区包含性）："
+          f"{'通过' if check_local_soundness(part).ok else '失败'}")
+    for y0 in (-3, 5):
+        c = run_bounded(corr, [{"x": 0, "y": y0}])
+        print(f"  独立有限执行 y0={y0}：断言违反 {len(c.assert_violations)} 起"
+              f"（仅用于找反例，不作证明）")
+
+    print()
+    print("=== 5) 分区数超上限：按标签序强制合并（不删状态，记录发生处）===")
+    merged = analyze(
+        merge_pressure(), partition_points=("s1", "s2", "s3"), max_partitions=2
+    )
+    print("三个条件位置产生 2^3=8 种标签组合，max_partitions=2 触发合并：")
+    for ev in merged.merges:
+        print(f"  合并发生处 block {ev.block!r}（{ev.phase} 第 {ev.round} 轮）："
+              f"并入 merged 的标签 {list(ev.merged_labels)}，保留 {list(ev.kept_labels)}")
+    for p in merged.block_partitions_in["end"]:
+        print(f"  end  分区 {p.label_text:7}  {p.state.text}")
+    print(f"断言结论：{[a.verdict for a in merged.asserts]}；"
+          f"独立检查器：{'通过' if check_local_soundness(merged).ok else '失败'}")
+
+    print()
+    print("=== 6) 实际触发的拒绝边界（非法输入必须报错且可定位）===")
     try:
         # bool 是 int 的子类，但契约明确拒绝 bool 充当整数常量
         CFG(

@@ -10,6 +10,9 @@
 分析
     :func:`analyze` -> :class:`AnalysisResult`（含 ``block_in`` / ``block_out`` /
     ``asserts``，每条断言为 ``proved`` 或 ``unknown``）
+    可选有限路径分区：``analyze(cfg, partition_points=(...), max_partitions=n)``
+    -> 结果另含 ``block_partitions_in/out``（:class:`Partition`）与
+    ``merges``（:class:`MergeEvent`，强制合并发生处）
 
 独立检查
     :func:`check_local_soundness`, :func:`check_transfer_step`,
@@ -48,6 +51,12 @@ from .engine import (
 from .errors import BudgetExhaustedError, IntervalAIError, ValidationError
 from .intervals import AbstractState, Interval
 from .concrete import ConcreteBudget, ConcreteReport, run_bounded
+from .partition import (
+    DEFAULT_MAX_PARTITIONS,
+    MAX_PARTITION_POINTS,
+    MergeEvent,
+    Partition,
+)
 from .transfer import edge_state, guard_interval, transfer_block, transfer_statement
 
 __all__ = [
@@ -69,6 +78,11 @@ __all__ = [
     "AnalysisResult",
     "AssertStatus",
     "MAX_NARROWING_ROUNDS",
+    # bounded path partitioning
+    "Partition",
+    "MergeEvent",
+    "MAX_PARTITION_POINTS",
+    "DEFAULT_MAX_PARTITIONS",
     # transfer
     "transfer_statement",
     "transfer_block",
