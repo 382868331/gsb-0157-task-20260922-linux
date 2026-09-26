@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import gcd
 
 from .cfg import (
     CFG,
@@ -27,6 +28,7 @@ from .cfg import (
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssignMul,
     Block,
     Guard,
     Statement,
@@ -34,7 +36,7 @@ from .cfg import (
 from .intervals import AbstractState, Interval
 
 # 参考域端点：None = 无穷。为保持独立性，不复用 intervals.py 里的比较函数。
-Bound = tuple[int | None, int | None]  # (lower, upper)
+Bound = tuple[int | None, int | None, int, int]  # (lower, upper, modulus, residue)
 _BOTTOM = object()  # 参考状态底标记
 _RefState = object  # dict[str, Bound] 或 _BOTTOM（仅作文档别名）
 
@@ -59,25 +61,80 @@ def _ref_le_upper(a: int | None, b: int | None) -> bool:
     return a <= b
 
 
-def _ref_iv_subseteq(a: Bound, b: Bound) -> bool:
-    return _ref_le_lower(b[0], a[0]) and _ref_le_upper(a[1], b[1])
+def _ref_norm_residue(r: int, m: int) -> int:
+    return r if m == 0 else r % m
+
+
+def _ref_has_point(value: Bound) -> bool:
+    lo, hi, m, r = value
+    if lo is not None and hi is not None and lo > hi:
+        return False
+    if m == 0:
+        return (lo is None or r >= lo) and (hi is None or r <= hi)
+    if lo is None:
+        return True
+    first = lo + (r - lo) % m
+    return hi is None or first <= hi
+
+
+def _ref_reduce(value: Bound) -> Bound | None:
+    lo, hi, m, r = value
+    if lo is not None and hi is not None and lo == hi:
+        exact = (lo, hi, 0, lo)
+        return exact if _ref_subseteq(exact, value) else None
+    return value if _ref_has_point(value) else None
+
+
+def _ref_subseteq(a: Bound, b: Bound) -> bool:
+    if not (_ref_le_lower(b[0], a[0]) and _ref_le_upper(a[1], b[1])):
+        return False
+    am, ar, bm, br = a[2], a[3], b[2], b[3]
+    if bm == 0:
+        return am == 0 and ar == br
+    if am == 0:
+        return ar % bm == br
+    return am % bm == 0 and ar % bm == br
 
 
 def _ref_join_iv(a: Bound, b: Bound) -> Bound:
     lo = None if (a[0] is None or b[0] is None) else min(a[0], b[0])
     hi = None if (a[1] is None or b[1] is None) else max(a[1], b[1])
-    return (lo, hi)
+    modulus = gcd(a[2], b[2], abs(a[3] - b[3]))
+    residue = a[3] if modulus == 0 else a[3] % modulus
+    return (lo, hi, modulus, residue)
 
 
 def _ref_add_iv(a: Bound, k: int) -> Bound:
-    return (None if a[0] is None else a[0] + k, None if a[1] is None else a[1] + k)
+    lo = None if a[0] is None else a[0] + k
+    hi = None if a[1] is None else a[1] + k
+    if a[2] == 0:
+        return (lo, hi, 0, a[3] + k)
+    return (lo, hi, a[2], (a[3] + k) % a[2])
+
+
+def _ref_scale_iv(a: Bound, k: int) -> Bound:
+    if a[2] == 0:
+        value = a[3] * k
+        return (value, value, 0, value)
+    if k == 0:
+        return (0, 0, 0, 0)
+    if k > 0:
+        lo = None if a[0] is None else a[0] * k
+        hi = None if a[1] is None else a[1] * k
+    else:
+        lo = None if a[1] is None else a[1] * k
+        hi = None if a[0] is None else a[0] * k
+    modulus = gcd(abs(k), a[2])
+    return (lo, hi, modulus, (a[3] * k) % modulus)
 
 
 def _ref_guard_bound(guard: Guard, taken: bool) -> Bound:
     c = guard.const
     if guard.op == "<=":
-        return (None, c) if taken else (c + 1, None)
-    return (c, None) if taken else (None, c - 1)
+        lo, hi = (None, c) if taken else (c + 1, None)
+    else:
+        lo, hi = (c, None) if taken else (None, c - 1)
+    return (lo, hi, 1, 0)
 
 
 def _ref_intersect_iv(a: Bound, b: Bound) -> Bound | None:
@@ -93,9 +150,8 @@ def _ref_intersect_iv(a: Bound, b: Bound) -> Bound | None:
         hi = a[1]
     else:
         hi = min(a[1], b[1])
-    if lo is not None and hi is not None and lo > hi:
-        return None
-    return (lo, hi)
+    candidate = (lo, hi, a[2], a[3])
+    return _ref_reduce(candidate)
 
 
 # -- 参考状态与独立转移 --------------------------------------------------------
@@ -103,7 +159,15 @@ def _ref_intersect_iv(a: Bound, b: Bound) -> Bound | None:
 def _from_abstract(state: AbstractState):
     if state.bottom:
         return _BOTTOM
-    return {v: (state.bounds[v].lower, state.bounds[v].upper) for v in state.variables}
+    return {
+        v: (
+            state.bounds[v].lower,
+            state.bounds[v].upper,
+            state.residues[v].modulus,
+            state.residues[v].residue,
+        )
+        for v in state.variables
+    }
 
 
 def _ref_transfer_stmt(env, stmt: Statement):
@@ -111,11 +175,13 @@ def _ref_transfer_stmt(env, stmt: Statement):
         return _BOTTOM
     out = dict(env)
     if isinstance(stmt, AssignConst):
-        out[stmt.target] = (stmt.const, stmt.const)
+        out[stmt.target] = (stmt.const, stmt.const, 0, stmt.const)
     elif isinstance(stmt, AssignCopy):
         out[stmt.target] = out[stmt.source]
     elif isinstance(stmt, AssignAdd):
         out[stmt.target] = _ref_add_iv(out[stmt.source], stmt.const)
+    elif isinstance(stmt, AssignMul):
+        out[stmt.target] = _ref_scale_iv(out[stmt.source], stmt.const)
     elif isinstance(stmt, AssertRange):
         pass  # 检查性语句不改变状态
     else:  # pragma: no cover - CFG 构造期已挡住
@@ -149,7 +215,7 @@ def _ref_state_subseteq(a, b) -> bool:
         return False
     if set(a) != set(b):
         return False
-    return all(_ref_iv_subseteq(a[v], b[v]) for v in a)
+    return all(_ref_subseteq(a[v], b[v]) for v in a)
 
 
 # -- 报告 ----------------------------------------------------------------------
@@ -222,7 +288,17 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
         v: cfg.entry_bounds[v] if v in cfg.entry_bounds else Interval(None, None)
         for v in cfg.variables
     }
-    initial_ref = {v: (iv.lower, iv.upper) for v, iv in initial.items()}
+    initial_ref = {}
+    for v, iv in initial.items():
+        congruence = cfg.entry_congruences.get(v)
+        if congruence is None:
+            if iv.lower is not None and iv.lower == iv.upper:
+                modulus, residue = 0, iv.lower
+            else:
+                modulus, residue = 1, 0
+        else:
+            modulus, residue = congruence.modulus, congruence.residue
+        initial_ref[v] = (iv.lower, iv.upper, modulus, residue)
     if not _ref_state_subseteq(initial_ref, entry_in):
         report.fail(f"block {cfg.entry!r}.in", "does not contain declared entry bounds")
 
@@ -264,9 +340,19 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
             report.fail(loc, f"illegal verdict {st.verdict!r}")
             continue
         if st.verdict == "proved" and not st.vacuous:
-            observed = (st.observed.lower, st.observed.upper)
-            required: Bound = (st.statement.lower, st.statement.upper)
-            if not _ref_iv_subseteq(observed, required):
+            observed: Bound = (
+                st.observed.lower,
+                st.observed.upper,
+                st.observed_congruence.modulus,
+                st.observed_congruence.residue,
+            )
+            required: Bound = (
+                st.statement.lower,
+                st.statement.upper,
+                st.statement.congruence.modulus,
+                st.statement.congruence.residue,
+            )
+            if not _ref_has_point(required) or not _ref_subseteq(observed, required):
                 report.fail(
                     loc,
                     f"marked proved but observed {observed} not contained in {required}",

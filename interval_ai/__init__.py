@@ -4,8 +4,9 @@
 
 数据结构
     :class:`CFG`, :class:`Block`, :class:`Guard`
-    :class:`AssignConst`, :class:`AssignCopy`, :class:`AssignAdd`, :class:`AssertRange`
-    :class:`Interval`, :class:`AbstractState`
+    :class:`AssignConst`, :class:`AssignCopy`, :class:`AssignAdd`,
+    :class:`AssignMul`, :class:`AssertRange`
+    :class:`Interval`, :class:`Congruence`, :class:`AbstractState`
 
 分析
     :func:`analyze` -> :class:`AnalysisResult`（含 ``block_in`` / ``block_out`` /
@@ -29,6 +30,7 @@ from .cfg import (
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssignMul,
     Block,
     CFG,
     Guard,
@@ -46,6 +48,7 @@ from .engine import (
     analyze,
 )
 from .errors import BudgetExhaustedError, IntervalAIError, ValidationError
+from .congruence import Congruence
 from .intervals import AbstractState, Interval
 from .concrete import ConcreteBudget, ConcreteReport, run_bounded
 from .transfer import edge_state, guard_interval, transfer_block, transfer_statement
@@ -58,11 +61,13 @@ __all__ = [
     "AssignConst",
     "AssignCopy",
     "AssignAdd",
+    "AssignMul",
     "AssertRange",
     "MAX_VARIABLES",
     "MAX_BLOCKS",
     # domain
     "Interval",
+    "Congruence",
     "AbstractState",
     # engine
     "analyze",

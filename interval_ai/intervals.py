@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .congruence import Congruence
 from .errors import ValidationError, require_int
 
 
@@ -180,6 +181,30 @@ class AbstractState:
     variables: tuple[str, ...]
     bounds: dict[str, Interval]
     bottom: bool = False
+    residues: dict[str, Congruence] | None = None
+
+    def __post_init__(self) -> None:
+        if self.bottom:
+            return
+        residues = self.residues or {}
+        normalized: dict[str, Congruence] = {}
+        for var in self.variables:
+            if var not in self.bounds:
+                raise KeyError(var)
+            congruence = residues.get(var, Congruence.arbitrary())
+            if not isinstance(congruence, Congruence):
+                raise TypeError("residue must be Congruence")
+            interval = self.bounds[var]
+            reduced = congruence.normalized_for_interval(interval.lower, interval.upper)
+            if reduced is None:
+                object.__setattr__(self, "bottom", True)
+                object.__setattr__(self, "bounds", {})
+                object.__setattr__(self, "residues", None)
+                return
+            normalized[var] = reduced
+        object.__setattr__(self, "variables", tuple(self.variables))
+        object.__setattr__(self, "bounds", dict(self.bounds))
+        object.__setattr__(self, "residues", normalized)
 
     @classmethod
     def bottom_of(cls, variables: tuple[str, ...]) -> "AbstractState":
@@ -191,6 +216,7 @@ class AbstractState:
             tuple(variables),
             {v: Interval.top() for v in variables},
             bottom=False,
+            residues={v: Congruence.arbitrary() for v in variables},
         )
 
     def get(self, var: str) -> Interval:
@@ -198,23 +224,43 @@ class AbstractState:
             raise ValueError("cannot read a variable from bottom state")
         return self.bounds[var]
 
+    def get_congruence(self, var: str) -> Congruence:
+        if self.bottom:
+            raise ValueError("cannot read a variable from bottom state")
+        assert self.residues is not None
+        return self.residues[var]
+
+    def value(self, var: str) -> tuple[Interval, Congruence]:
+        return self.get(var), self.get_congruence(var)
+
+    @staticmethod
+    def _congruence_for_interval(interval: Interval) -> Congruence:
+        if interval.lower is not None and interval.lower == interval.upper:
+            return Congruence.exact(interval.lower)
+        return Congruence.arbitrary()
+
     def _join_into(self, other: "AbstractState", how: str) -> "AbstractState":
         if self.bottom:
             return other
         if other.bottom:
             return self
         bounds: dict[str, Interval] = {}
+        residues: dict[str, Congruence] = {}
         for v in self.variables:
             a, b = self.bounds[v], other.bounds[v]
+            ra, rb = self.get_congruence(v), other.get_congruence(v)
             if how == "join":
                 bounds[v] = a.join(b)
+                residues[v] = ra.join(rb)
             elif how == "widen":
                 bounds[v] = a.widen(b)
+                residues[v] = ra.join(rb)
             elif how == "narrow":
                 bounds[v] = a.narrow(b)
+                residues[v] = ra
             else:  # pragma: no cover - 内部调用不会出现
                 raise AssertionError(how)
-        return AbstractState(self.variables, bounds, False)
+        return AbstractState(self.variables, bounds, False, residues)
 
     def join(self, other: "AbstractState") -> "AbstractState":
         return self._join_into(other, "join")
@@ -234,9 +280,14 @@ class AbstractState:
         if other.bottom:
             return self
         bounds: dict[str, Interval] = {}
+        residues: dict[str, Congruence] = {}
         for v in self.variables:
-            bounds[v] = self.bounds[v].widen(other.bounds[v]) if v in widened else self.bounds[v].join(other.bounds[v])
-        return AbstractState(self.variables, bounds, False)
+            if v in widened:
+                bounds[v] = self.bounds[v].widen(other.bounds[v])
+            else:
+                bounds[v] = self.bounds[v].join(other.bounds[v])
+            residues[v] = self.get_congruence(v).join(other.get_congruence(v))
+        return AbstractState(self.variables, bounds, False, residues)
 
     def narrow_selective(
         self, other: "AbstractState", widened: set[str]
@@ -247,9 +298,15 @@ class AbstractState:
         if other.bottom:
             return self
         bounds: dict[str, Interval] = {}
+        residues: dict[str, Congruence] = {}
         for v in self.variables:
-            bounds[v] = self.bounds[v].narrow(other.bounds[v]) if v in widened else other.bounds[v]
-        return AbstractState(self.variables, bounds, False)
+            if v in widened:
+                bounds[v] = self.bounds[v].narrow(other.bounds[v])
+                residues[v] = self.get_congruence(v)
+            else:
+                bounds[v] = other.bounds[v]
+                residues[v] = other.get_congruence(v)
+        return AbstractState(self.variables, bounds, False, residues)
 
     def subseteq(self, other: "AbstractState") -> bool:
         """逐变量符号包含；底 ⊆ 一切。"""
@@ -257,14 +314,40 @@ class AbstractState:
             return True
         if other.bottom:
             return False
-        return all(self.bounds[v].subseteq(other.bounds[v]) for v in self.variables)
+        return all(
+            self.bounds[v].subseteq(other.bounds[v])
+            and self.get_congruence(v).subseteq(other.get_congruence(v))
+            for v in self.variables
+        )
 
-    def assign(self, var: str, value: Interval) -> "AbstractState":
+    def assign(
+        self,
+        var: str,
+        value: Interval,
+        congruence: Congruence | None = None,
+    ) -> "AbstractState":
         if self.bottom:
             return self
         bounds = dict(self.bounds)
+        residues = dict(self.residues or {})
         bounds[var] = value
-        return AbstractState(self.variables, bounds, False)
+        residues[var] = (
+            self._congruence_for_interval(value)
+            if congruence is None
+            else congruence
+        )
+        return AbstractState(self.variables, bounds, False, residues)
+
+    def assign_value(
+        self, var: str, value: Interval, congruence: Congruence
+    ) -> "AbstractState":
+        if self.bottom:
+            return self
+        bounds = dict(self.bounds)
+        residues = dict(self.residues or {})
+        bounds[var] = value
+        residues[var] = congruence
+        return AbstractState(self.variables, bounds, False, residues)
 
     def restrict(self, var: str, iv: Interval | None) -> "AbstractState":
         """与单变量区间 iv 取交；为空则到底。"""
@@ -276,16 +359,32 @@ class AbstractState:
         if new_iv is None:
             return AbstractState.bottom_of(self.variables)
         bounds = dict(self.bounds)
+        residues = dict(self.residues or {})
         bounds[var] = new_iv
-        return AbstractState(self.variables, bounds, False)
+        if new_iv.lower is not None and new_iv.lower == new_iv.upper:
+            exact = Congruence.exact(new_iv.lower)
+            if not exact.subseteq(residues[var]):
+                return AbstractState.bottom_of(self.variables)
+            residues[var] = exact
+        elif not residues[var].has_point_within(new_iv.lower, new_iv.upper):
+            return AbstractState.bottom_of(self.variables)
+        return AbstractState(self.variables, bounds, False, residues)
 
     @property
     def text(self) -> str:
         if self.bottom:
             return "bottom (unreachable)"
-        return ", ".join(f"{v}: {self.bounds[v].text}" for v in self.variables)
+        assert self.residues is not None
+        return ", ".join(
+            f"{v}: {self.bounds[v].text}, {self.residues[v].text}" for v in self.variables
+        )
 
     def to_dict(self) -> dict[str, object]:
         if self.bottom:
             return {"bottom": True}
-        return {"bottom": False, "bounds": {v: self.bounds[v].to_dict() for v in self.variables}}
+        assert self.residues is not None
+        return {
+            "bottom": False,
+            "bounds": {v: self.bounds[v].to_dict() for v in self.variables},
+            "congruences": {v: self.residues[v].to_dict() for v in self.variables},
+        }

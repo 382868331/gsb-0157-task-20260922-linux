@@ -1,11 +1,12 @@
 """控制流图（CFG）公开数据结构与构造期校验。
 
-语言子集（数学整数变量，无除法、无乘法、无表达式混合）：
+语言子集（数学整数变量，无除法、无表达式混合）：
 
 * ``AssignConst(target, c)``          -- target = c
 * ``AssignCopy(target, source)``      -- target = source
 * ``AssignAdd(target, source, k)``    -- target = source + k（k 可为负整数）
-* ``AssertRange(target, lo, hi)``     -- 断言 lo <= target <= hi（不改变状态）
+* ``AssignMul(target, source, k)``    -- target = k * source（k 可为负整数或 0）
+* ``AssertRange(target, lo, hi, c)``  -- 断言范围与可选同余（不改变状态）
 
 分支由块尾 :class:`Guard` 表达：``Guard(x, "<=", c)`` 为真走 0 号后继，
 为假（整数上即 x >= c+1）走 1 号后继；``">="`` 同理（假支 x <= c-1）。
@@ -22,6 +23,7 @@ from typing import Mapping, Sequence
 
 from .errors import ValidationError, require_int
 from .intervals import Interval
+from .congruence import Congruence
 
 MAX_VARIABLES = 20
 MAX_BLOCKS = 40
@@ -62,16 +64,28 @@ class AssignAdd:
 
 
 @dataclass(frozen=True, slots=True)
+class AssignMul:
+    target: str
+    source: str
+    const: int
+
+    def __post_init__(self) -> None:
+        require_int(self.const, "AssignMul.const")
+
+
+@dataclass(frozen=True, slots=True)
 class AssertRange:
-    """断言 lower <= target <= upper；端点允许为 ``None``（无穷）。
+    """断言 lower <= target <= upper，且可选地满足同一同余类。
 
     例如 assert x <= c 写作 ``AssertRange(x, None, c)``，
-    assert x >= c 写作 ``AssertRange(x, c, None)``。
+    assert x >= c 写作 ``AssertRange(x, c, None)``；偶数断言写作
+    ``AssertRange(x, None, None, Congruence(2, 0))``。
     """
 
     target: str
     lower: int | None
     upper: int | None
+    congruence: Congruence = Congruence(1, 0)
 
     def __post_init__(self) -> None:
         if self.lower is not None:
@@ -82,14 +96,16 @@ class AssertRange:
             self.lower is not None
             and self.upper is not None
             and self.lower > self.upper
-        ):
-            raise ValidationError(
+            ):
+                raise ValidationError(
                 f"assert range [{self.lower}, {self.upper}] has lower > upper",
                 "AssertRange",
             )
+        if not isinstance(self.congruence, Congruence):
+            raise ValidationError("congruence must be Congruence", "AssertRange.congruence")
 
 
-Statement = AssignConst | AssignCopy | AssignAdd | AssertRange
+Statement = AssignConst | AssignCopy | AssignAdd | AssignMul | AssertRange
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +153,7 @@ class CFG:
     blocks: Mapping[str, Block]
     entry: str
     entry_bounds: Mapping[str, Interval] = field(default_factory=dict)
+    entry_congruences: Mapping[str, Congruence] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._validate()
@@ -240,6 +257,29 @@ class CFG:
                 )
         object.__setattr__(self, "entry_bounds", bounds)
 
+        congruences = dict(self.entry_congruences)
+        for key, val in congruences.items():
+            if key not in vset:
+                raise ValidationError(
+                    f"entry_congruences variable {key!r} is not declared",
+                    f"CFG.entry_congruences[{key!r}]",
+                )
+            if not isinstance(val, Congruence):
+                raise ValidationError(
+                    f"entry congruence must be Congruence, got {type(val).__name__}",
+                    f"CFG.entry_congruences[{key!r}]",
+                )
+        for key, interval in bounds.items():
+            congruence = congruences.get(key)
+            if congruence is None:
+                continue
+            if congruence.normalized_for_interval(interval.lower, interval.upper) is None:
+                raise ValidationError(
+                    f"entry bound {interval.text} contains no point satisfying {congruence.text}",
+                    f"CFG.entry_congruences[{key!r}]",
+                )
+        object.__setattr__(self, "entry_congruences", congruences)
+
     def _validate_statement(self, st: object, loc: str, vset: set[str]) -> None:
         if isinstance(st, AssignConst):
             if st.target not in vset:
@@ -255,7 +295,7 @@ class CFG:
                 raise ValidationError(
                     f"source {st.source!r} is not declared", f"{loc}.source"
                 )
-        elif isinstance(st, AssignAdd):
+        elif isinstance(st, (AssignAdd, AssignMul)):
             if st.target not in vset:
                 raise ValidationError(
                     f"target {st.target!r} is not declared", f"{loc}.target"
@@ -284,3 +324,11 @@ class CFG:
         top = {v: Interval.top() for v in self.variables}
         top.update(self.entry_bounds)
         return top
+
+    def initial_state_congruences(self) -> dict[str, Congruence]:
+        residues = {v: Congruence.arbitrary() for v in self.variables}
+        for var, interval in self.initial_state_intervals().items():
+            if interval.lower is not None and interval.lower == interval.upper:
+                residues[var] = Congruence.exact(interval.lower)
+        residues.update(self.entry_congruences)
+        return residues

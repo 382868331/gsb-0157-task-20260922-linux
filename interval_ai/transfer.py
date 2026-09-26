@@ -15,6 +15,7 @@ from .cfg import (
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssignMul,
     Block,
     Guard,
     Statement,
@@ -38,12 +39,39 @@ def transfer_statement(state: AbstractState, stmt: Statement) -> AbstractState:
     if isinstance(stmt, AssignConst):
         return state.assign(stmt.target, Interval.singleton(stmt.const))
     if isinstance(stmt, AssignCopy):
-        return state.assign(stmt.target, state.get(stmt.source))
+        return state.assign_value(
+            stmt.target, state.get(stmt.source), state.get_congruence(stmt.source)
+        )
     if isinstance(stmt, AssignAdd):
-        return state.assign(stmt.target, state.get(stmt.source).add(stmt.const))
+        return state.assign_value(
+            stmt.target,
+            state.get(stmt.source).add(stmt.const),
+            state.get_congruence(stmt.source).shift(stmt.const),
+        )
+    if isinstance(stmt, AssignMul):
+        return state.assign_value(
+            stmt.target,
+            _scale_interval(state.get(stmt.source), stmt.const),
+            state.get_congruence(stmt.source).scale(stmt.const),
+        )
     if isinstance(stmt, AssertRange):
         return state  # 断言不改变状态
     raise TypeError(f"unsupported statement: {type(stmt).__name__}")  # pragma: no cover
+
+
+def _scale_interval(interval: Interval, k: int) -> Interval:
+    """常量乘法 x -> k*x 的区间像，正确处理负方向与 k=0。"""
+    if k == 0:
+        return Interval(0, 0)
+    if k > 0:
+        return Interval(
+            None if interval.lower is None else interval.lower * k,
+            None if interval.upper is None else interval.upper * k,
+        )
+    return Interval(
+        None if interval.upper is None else interval.upper * k,
+        None if interval.lower is None else interval.lower * k,
+    )
 
 
 def transfer_block(state: AbstractState, block: Block) -> AbstractState:

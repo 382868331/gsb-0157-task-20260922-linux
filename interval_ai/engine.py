@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from .cfg import CFG, AssertRange, Block
 from .errors import BudgetExhaustedError
+from .congruence import Congruence
 from .intervals import AbstractState, Interval
 from .transfer import edge_state, transfer_block, transfer_statement
 
@@ -118,6 +119,7 @@ class AssertStatus:
     statement: AssertRange
     verdict: str  # "proved" | "unknown"
     observed: Interval | None  # 分析到的实际区间；不可达位置为 None
+    observed_congruence: Congruence | None = None
     vacuous: bool = False  # 位置不可达，空真成立
 
     def to_dict(self) -> dict[str, object]:
@@ -133,6 +135,10 @@ class AssertStatus:
             d["vacuous"] = self.vacuous
         else:
             d["observed"] = self.observed.to_dict()
+            d["observed_congruence"] = (
+                None if self.observed_congruence is None
+                else self.observed_congruence.to_dict()
+            )
             d["vacuous"] = self.vacuous
         return d
 
@@ -177,7 +183,12 @@ class AnalysisResult:
 # -- 引擎 ---------------------------------------------------------------------
 
 def _initial_entry_state(cfg: CFG) -> AbstractState:
-    return AbstractState(cfg.variable_tuple, cfg.initial_state_intervals(), False)
+    return AbstractState(
+        cfg.variable_tuple,
+        cfg.initial_state_intervals(),
+        False,
+        cfg.initial_state_congruences(),
+    )
 
 
 def _join_inputs(
@@ -310,12 +321,48 @@ def _evaluate_asserts(cfg: CFG, ins: dict[str, AbstractState]) -> list[AssertSta
                     )
                 else:
                     observed = state.get(stmt.target)
+                    observed_congruence = state.get_congruence(stmt.target)
                     required = Interval(stmt.lower, stmt.upper)
-                    verdict = "proved" if observed.subseteq(required) else "unknown"
+                    required_pair = (
+                        stmt.lower,
+                        stmt.upper,
+                        stmt.congruence.modulus,
+                        stmt.congruence.residue,
+                    )
+                    observed_pair = (
+                        observed.lower,
+                        observed.upper,
+                        observed_congruence.modulus,
+                        observed_congruence.residue,
+                    )
+                    verdict = (
+                        "proved"
+                        if _observed_pair_subseteq(observed_pair, required_pair)
+                        else "unknown"
+                    )
                     statuses.append(
-                        AssertStatus(name, i, stmt, verdict, observed, False)
+                        AssertStatus(
+                            name, i, stmt, verdict, observed,
+                            observed_congruence, False,
+                        )
                     )
             else:
                 # 推进到下一语句前的状态
                 state = transfer_statement(state, stmt)
     return statuses
+
+
+def _observed_pair_subseteq(observed: tuple, required: tuple) -> bool:
+    lo, hi, modulus, residue = observed
+    req_lo, req_hi, req_modulus, req_residue = required
+    interval_ok = (
+        (req_lo is None or lo is not None and lo >= req_lo)
+        and (req_hi is None or hi is not None and hi <= req_hi)
+    )
+    if not interval_ok:
+        return False
+    if req_modulus == 0:
+        return modulus == 0 and residue == req_residue
+    if modulus == 0:
+        return residue % req_modulus == req_residue
+    return modulus % req_modulus == 0 and residue % req_modulus == req_residue
