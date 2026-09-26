@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 from .cfg import CFG, AssertRange, Block
 from .errors import BudgetExhaustedError
-from .intervals import AbstractState, Interval
+from .intervals import AbstractState, Congruence, Interval
 from .transfer import edge_state, transfer_block, transfer_statement
 
 MAX_NARROWING_ROUNDS = 8
@@ -118,6 +118,7 @@ class AssertStatus:
     statement: AssertRange
     verdict: str  # "proved" | "unknown"
     observed: Interval | None  # 分析到的实际区间；不可达位置为 None
+    observed_congruence: Congruence | None = None
     vacuous: bool = False  # 位置不可达，空真成立
 
     def to_dict(self) -> dict[str, object]:
@@ -177,7 +178,14 @@ class AnalysisResult:
 # -- 引擎 ---------------------------------------------------------------------
 
 def _initial_entry_state(cfg: CFG) -> AbstractState:
-    return AbstractState(cfg.variable_tuple, cfg.initial_state_intervals(), False)
+    state = AbstractState.top_of(cfg.variable_tuple)
+    intervals = cfg.initial_state_intervals()
+    congruences = cfg.initial_state_congruences()
+    for var in cfg.variable_tuple:
+        state = state.restrict(var, intervals[var], congruences[var])
+        if state.bottom:
+            return state
+    return state
 
 
 def _join_inputs(
@@ -306,14 +314,15 @@ def _evaluate_asserts(cfg: CFG, ins: dict[str, AbstractState]) -> list[AssertSta
             if isinstance(stmt, AssertRange):
                 if state.bottom:
                     statuses.append(
-                        AssertStatus(name, i, stmt, "proved", None, vacuous=True)
+                        AssertStatus(name, i, stmt, "proved", None, None, True)
                     )
                 else:
                     observed = state.get(stmt.target)
                     required = Interval(stmt.lower, stmt.upper)
                     verdict = "proved" if observed.subseteq(required) else "unknown"
+                    observed_cong = state.get_congruence(stmt.target)
                     statuses.append(
-                        AssertStatus(name, i, stmt, verdict, observed, False)
+                        AssertStatus(name, i, stmt, verdict, observed, observed_cong, False)
                     )
             else:
                 # 推进到下一语句前的状态

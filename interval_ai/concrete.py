@@ -14,7 +14,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .cfg import CFG, AssertRange, AssignAdd, AssignConst, AssignCopy, Block
+from .cfg import (
+    CFG,
+    AssertRange,
+    AssignAdd,
+    AssignConst,
+    AssignCopy,
+    AssignMul,
+    Block,
+)
 
 Store = dict[str, int]
 
@@ -47,6 +55,8 @@ def _exec_statement(store: Store, stmt) -> Store:
         nxt[stmt.target] = store[stmt.source]
     elif isinstance(stmt, AssignAdd):
         nxt[stmt.target] = store[stmt.source] + stmt.const
+    elif isinstance(stmt, AssignMul):
+        nxt[stmt.target] = store[stmt.source] * stmt.const
     elif isinstance(stmt, AssertRange):
         pass
     else:  # pragma: no cover - CFG 构造期保证

@@ -10,7 +10,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import gcd
 
 from .errors import ValidationError, require_int
 
@@ -174,12 +175,152 @@ class Interval:
 
 
 @dataclass(frozen=True, slots=True)
+class Congruence:
+    """同余类 x ≡ remainder (mod modulus)。
+
+    ``modulus=0`` 表示精确常量 remainder；``modulus=1`` 表示任意整数。
+    非零模数的余数统一满足 ``0 <= remainder < modulus``，包括负数仿射变换后。
+    """
+
+    modulus: int
+    remainder: int = 0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.modulus, bool) or not isinstance(self.modulus, int):
+            raise ValidationError("Congruence.modulus must be an int", "Congruence.modulus")
+        if isinstance(self.remainder, bool) or not isinstance(self.remainder, int):
+            raise ValidationError("Congruence.remainder must be an int", "Congruence.remainder")
+        if self.modulus < 0:
+            raise ValidationError("Congruence.modulus must be >= 0", "Congruence.modulus")
+        r = self.remainder if self.modulus == 0 else self.remainder % self.modulus
+        object.__setattr__(self, "remainder", r)
+
+    @classmethod
+    def top(cls) -> "Congruence":
+        return cls(1, 0)
+
+    @classmethod
+    def exact(cls, value: int) -> "Congruence":
+        require_int(value, "Congruence.exact.value")
+        return cls(0, value)
+
+    @property
+    def is_top(self) -> bool:
+        return self.modulus == 1
+
+    @property
+    def is_exact(self) -> bool:
+        return self.modulus == 0
+
+    def contains_int(self, value: int) -> bool:
+        require_int(value, "Congruence.contains_int.value")
+        if self.modulus == 0:
+            return value == self.remainder
+        return value % self.modulus == self.remainder
+
+    def contains(self, other: "Congruence") -> bool:
+        """是否包含另一个同余类。模数越小越粗；m=0 为单元素。"""
+        if self.modulus == 1:
+            return True
+        if self.modulus == 0:
+            return other.modulus == 0 and other.remainder == self.remainder
+        if other.modulus == 0:
+            return other.remainder % self.modulus == self.remainder
+        return other.modulus % self.modulus == 0 and other.remainder % self.modulus == self.remainder
+
+    def subseteq(self, other: "Congruence") -> bool:
+        return other.contains(self)
+
+    def join(self, other: "Congruence") -> "Congruence":
+        """包含两个同余类的最粗公共同余信息。"""
+        if self.modulus == 0 and other.modulus == 0:
+            return self if self.remainder == other.remainder else Congruence(abs(self.remainder - other.remainder), self.remainder)
+        modulus = gcd(self.modulus, other.modulus, abs(self.remainder - other.remainder))
+        remainder = 0 if modulus == 0 else self.remainder % modulus
+        return Congruence(modulus, remainder)
+
+    def intersect(self, other: "Congruence") -> "Congruence | None":
+        """两个同余类的交；余数约束不相容时返回 ``None``。"""
+        if self.modulus == 0:
+            return self if other.contains_int(self.remainder) else None
+        if other.modulus == 0:
+            return other if self.contains_int(other.remainder) else None
+        g = gcd(self.modulus, other.modulus)
+        if (other.remainder - self.remainder) % g != 0:
+            return None
+        modulus = self.modulus // g * other.modulus
+        if modulus == 1:
+            return Congruence.top()
+        a, b = self.modulus // g, other.modulus // g
+        delta = (other.remainder - self.remainder) // g
+        if b == 1:
+            k = 0
+        else:
+            old_r, r = a, b
+            old_s, s = 1, 0
+            while r:
+                q = old_r // r
+                old_r, r = r, old_r - q * r
+                old_s, s = s, old_s - q * s
+            k = (delta * old_s) % b
+        value = self.remainder + self.modulus * k
+        return Congruence(modulus, value % modulus)
+
+    def affine(self, coefficient: int, constant: int) -> "Congruence":
+        """仿射像 x -> coefficient*x + constant；允许负系数和零系数。"""
+        require_int(coefficient, "Congruence.affine.coefficient")
+        require_int(constant, "Congruence.affine.constant")
+        if self.modulus == 0 or coefficient == 0:
+            return Congruence.exact(
+                (coefficient * self.remainder if self.modulus == 0 else 0) + constant
+            )
+        modulus = abs(coefficient) * self.modulus
+        return Congruence(modulus, (coefficient * self.remainder + constant) % modulus)
+
+    @property
+    def text(self) -> str:
+        if self.modulus == 0:
+            return f"={self.remainder}"
+        if self.modulus == 1:
+            return "any"
+        return f"≡{self.remainder} (mod {self.modulus})"
+
+    def to_dict(self) -> dict[str, int]:
+        return {"modulus": self.modulus, "remainder": self.remainder}
+
+
+def interval_has_congruence(interval: Interval, congruence: Congruence) -> bool:
+    """符号判断闭区间内是否存在满足同余的整数，不枚举整个区间。"""
+    if congruence.modulus == 0:
+        return interval.contains_int(congruence.remainder)
+    if congruence.modulus == 1:
+        return True
+    if interval.lower is None:
+        return True
+    first = interval.lower + ((congruence.remainder - interval.lower) % congruence.modulus)
+    return interval.upper is None or first <= interval.upper
+
+
+@dataclass(frozen=True, slots=True)
 class AbstractState:
     """对一组变量的逐变量区间映射；``bottom=True`` 表示不可达（底元素）。"""
 
     variables: tuple[str, ...]
     bounds: dict[str, Interval]
     bottom: bool = False
+    residues: dict[str, Congruence] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "variables", tuple(self.variables))
+        if self.bottom:
+            object.__setattr__(self, "bounds", {})
+            object.__setattr__(self, "residues", {})
+            return
+        object.__setattr__(self, "bounds", dict(self.bounds))
+        residues = dict(self.residues)
+        for var in self.variables:
+            residues.setdefault(var, Congruence.top())
+        object.__setattr__(self, "residues", residues)
 
     @classmethod
     def bottom_of(cls, variables: tuple[str, ...]) -> "AbstractState":
@@ -190,6 +331,7 @@ class AbstractState:
         return cls(
             tuple(variables),
             {v: Interval.top() for v in variables},
+            residues={v: Congruence.top() for v in variables},
             bottom=False,
         )
 
@@ -198,23 +340,38 @@ class AbstractState:
             raise ValueError("cannot read a variable from bottom state")
         return self.bounds[var]
 
+    def get_congruence(self, var: str) -> Congruence:
+        if self.bottom:
+            raise ValueError("cannot read a variable from bottom state")
+        return self.residues[var]
+
+    @staticmethod
+    def _join_congruence(a: Congruence, b: Congruence, how: str) -> Congruence:
+        if how == "narrow":
+            return b if b.subseteq(a) else a
+        return a.join(b)
+
     def _join_into(self, other: "AbstractState", how: str) -> "AbstractState":
         if self.bottom:
             return other
         if other.bottom:
             return self
         bounds: dict[str, Interval] = {}
+        residues: dict[str, Congruence] = {}
         for v in self.variables:
             a, b = self.bounds[v], other.bounds[v]
             if how == "join":
                 bounds[v] = a.join(b)
+                residues[v] = self._join_congruence(self.residues[v], other.residues[v], "join")
             elif how == "widen":
                 bounds[v] = a.widen(b)
+                residues[v] = self.residues[v].join(other.residues[v])
             elif how == "narrow":
                 bounds[v] = a.narrow(b)
+                residues[v] = self._join_congruence(self.residues[v], other.residues[v], "narrow")
             else:  # pragma: no cover - 内部调用不会出现
                 raise AssertionError(how)
-        return AbstractState(self.variables, bounds, False)
+        return AbstractState(self.variables, bounds, False, residues)
 
     def join(self, other: "AbstractState") -> "AbstractState":
         return self._join_into(other, "join")
@@ -234,9 +391,14 @@ class AbstractState:
         if other.bottom:
             return self
         bounds: dict[str, Interval] = {}
+        residues: dict[str, Congruence] = {}
         for v in self.variables:
-            bounds[v] = self.bounds[v].widen(other.bounds[v]) if v in widened else self.bounds[v].join(other.bounds[v])
-        return AbstractState(self.variables, bounds, False)
+            if v in widened:
+                bounds[v] = self.bounds[v].widen(other.bounds[v])
+            else:
+                bounds[v] = self.bounds[v].join(other.bounds[v])
+            residues[v] = self.residues[v].join(other.residues[v])
+        return AbstractState(self.variables, bounds, False, residues)
 
     def narrow_selective(
         self, other: "AbstractState", widened: set[str]
@@ -247,9 +409,15 @@ class AbstractState:
         if other.bottom:
             return self
         bounds: dict[str, Interval] = {}
+        residues: dict[str, Congruence] = {}
         for v in self.variables:
             bounds[v] = self.bounds[v].narrow(other.bounds[v]) if v in widened else other.bounds[v]
-        return AbstractState(self.variables, bounds, False)
+            residues[v] = (
+                other.residues[v]
+                if other.residues[v].subseteq(self.residues[v])
+                else self.residues[v]
+            )
+        return AbstractState(self.variables, bounds, False, residues)
 
     def subseteq(self, other: "AbstractState") -> bool:
         """逐变量符号包含；底 ⊆ 一切。"""
@@ -257,16 +425,34 @@ class AbstractState:
             return True
         if other.bottom:
             return False
-        return all(self.bounds[v].subseteq(other.bounds[v]) for v in self.variables)
+        return all(
+            self.bounds[v].subseteq(other.bounds[v])
+            and self.residues[v].subseteq(other.residues[v])
+            for v in self.variables
+        )
 
-    def assign(self, var: str, value: Interval) -> "AbstractState":
+    def assign(
+        self,
+        var: str,
+        value: Interval,
+        congruence: Congruence | None = None,
+    ) -> "AbstractState":
         if self.bottom:
             return self
         bounds = dict(self.bounds)
+        residues = dict(self.residues)
         bounds[var] = value
-        return AbstractState(self.variables, bounds, False)
+        residues[var] = self.residues[var] if congruence is None else congruence
+        if not interval_has_congruence(value, residues[var]):
+            return AbstractState.bottom_of(self.variables)
+        return AbstractState(self.variables, bounds, False, residues)
 
-    def restrict(self, var: str, iv: Interval | None) -> "AbstractState":
+    def restrict(
+        self,
+        var: str,
+        iv: Interval | None,
+        congruence: Congruence | None = None,
+    ) -> "AbstractState":
         """与单变量区间 iv 取交；为空则到底。"""
         if self.bottom:
             return self
@@ -275,17 +461,32 @@ class AbstractState:
         new_iv = self.bounds[var].intersect(iv)
         if new_iv is None:
             return AbstractState.bottom_of(self.variables)
+        new_cong = self.residues[var]
+        if new_iv.lower is not None and new_iv.lower == new_iv.upper:
+            new_cong = new_cong.intersect(Congruence.exact(new_iv.lower))
+        if congruence is not None and new_cong is not None:
+            new_cong = congruence if congruence.is_top else new_cong.intersect(congruence)
+        if new_cong is None or not interval_has_congruence(new_iv, new_cong):
+            return AbstractState.bottom_of(self.variables)
         bounds = dict(self.bounds)
+        residues = dict(self.residues)
         bounds[var] = new_iv
-        return AbstractState(self.variables, bounds, False)
+        residues[var] = new_cong
+        return AbstractState(self.variables, bounds, False, residues)
 
     @property
     def text(self) -> str:
         if self.bottom:
             return "bottom (unreachable)"
-        return ", ".join(f"{v}: {self.bounds[v].text}" for v in self.variables)
+        return ", ".join(
+            f"{v}: {self.bounds[v].text} / {self.residues[v].text}" for v in self.variables
+        )
 
     def to_dict(self) -> dict[str, object]:
         if self.bottom:
             return {"bottom": True}
-        return {"bottom": False, "bounds": {v: self.bounds[v].to_dict() for v in self.variables}}
+        return {
+            "bottom": False,
+            "bounds": {v: self.bounds[v].to_dict() for v in self.variables},
+            "congruences": {v: self.residues[v].to_dict() for v in self.variables},
+        }

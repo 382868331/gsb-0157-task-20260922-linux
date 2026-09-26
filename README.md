@@ -1,10 +1,10 @@
-# 整数循环的区间抽象解释（interval_ai）
+# 整数循环的区间 + 同余抽象解释（interval_ai）
 
-一个从零实现、仅依赖标准库的**区间域抽象解释**可复用题库：输入小型控制流图
-（CFG，变量为数学整数），输出每个基本块的入/出区间不变量、循环加宽/收窄
-迭代过程，并对范围断言给出 `proved` / `unknown` 结论。另含一个**独立**的
-局部转移包含性检查器（符号端点证明，不做有限采样）和一个**独立**的确定性
-具体执行器（仅用于有界程序的覆盖性对照）。
+一个从零实现、仅依赖标准库的**区间 + 同余联合域抽象解释**可复用题库：输入小型
+控制流图（CFG，变量为数学整数），输出每个基本块入/出状态的两部分不变量：闭区间
+与同余类 `x ≡ r (mod m)`，并执行循环加宽/收窄迭代。另含一个**独立**的局部转移
+包含性检查器（符号端点与同余证明，不做有限采样）和一个**独立**的确定性具体执行器
+（仅用于有界程序的覆盖性补充）。
 
 ## 运行环境
 
@@ -14,10 +14,17 @@
 - Linux 原生运行验证。
 
 ```bash
+# 可选：创建并激活标准库 venv（无需安装第三方包）
+python -m venv .venv
+source .venv/bin/activate
+
 # 必要测试
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.05 秒，远小于 8 秒预算；真实计算，无 sleep、无预录结果）
+# 本次同余增量演示（远小于 90 秒；真实计算，无 sleep、无预录结果）
+python demo_iteration.py
+
+# 旧区间题库演示仍可运行
 python demo.py
 ```
 
@@ -27,10 +34,10 @@ python demo.py
 |---|---|
 | 变量数 | 1 ≤ 变量 ≤ **20** |
 | 基本块数 | 1 ≤ 块 ≤ **40** |
-| 语句 | `x = c`、`x = y`、`x = y + c`（c 为任意整数，可负）、`assert lo <= x <= hi`（端点可无穷） |
+| 语句 | `x = c`、`x = y`、`x = y + c`、`x = y * c`（c 为任意整数，可负、可零）、`assert lo <= x <= hi`（端点可无穷） |
 | 块尾条件 | `x <= c`、`x >= c`；真支走第 0 个后继，假支（整数补集）走第 1 个后继 |
 | 后继数 | 0（终止块）、1（无条件）、2（必须带守卫） |
-| 数值域 | 数学整数（Python 任意精度 `int`），无溢出、无除法/乘法/函数调用 |
+| 数值域 | 数学整数（Python 任意精度 `int`），无溢出、无除法/变量乘法/函数调用 |
 
 守卫的整数补集：`x <= c` 为假 ⇔ `x >= c+1`；`x >= c` 为假 ⇔ `x <= c-1`。
 
@@ -40,9 +47,9 @@ python demo.py
 from interval_ai import (
     # CFG
     CFG, Block, Guard,
-    AssignConst, AssignCopy, AssignAdd, AssertRange,
+    AssignConst, AssignCopy, AssignAdd, AssignMul, AssertRange,
     # 域
-    Interval, AbstractState,
+    Interval, Congruence, AbstractState, interval_has_congruence,
     # 分析
     analyze, AnalysisResult, AssertStatus, MAX_NARROWING_ROUNDS,
     # 局部转移（也可单独复用）
@@ -60,7 +67,13 @@ from interval_ai import (
 - `Interval(lower, upper)`：闭整数区间；`None` 表示无穷端点
   （`Interval(0, None)` = [0,+∞)）。提供 `join`（凸包）、`intersect`、
   `subseteq`、`add`、`widen`、`narrow`。
-- `CFG(variables, blocks, entry, entry_bounds=None)`：构造时一次性校验，
+- `Congruence(modulus, remainder)`：同余类。`m=0` 是精确常量；`m=1` 是任意
+  整数；非零模数自动规范化为 `0 <= r < m`。提供 `join`（gcd 合流）、
+  `intersect`（相容同余求交）、`affine(c,k)`（`x -> c*x+k`，允许负系数）。
+- `AbstractState` 对每个变量同时保存区间与同余；赋值、加常数、常数乘法、复制和
+  守卫限制后都会归约，闭区间中没有合法同余点时该状态为 `bottom`。状态文本格式为
+  `变量: [区间] / 同余`。
+- `CFG(..., entry_bounds=None, entry_congruences=None)`：构造时一次性校验，
   非法输入抛 `ValidationError`（异常 `location` 可定位到块/语句/参数）。
 - `result = analyze(cfg)`：
   - `result.block_in[name]` / `result.block_out[name]`：`AbstractState`
@@ -73,7 +86,7 @@ from interval_ai import (
   - `result.post_widening_in/out` 与 `result.narrowing_refined`：
     收窄前快照与"收窄是否确实改善"。
 - `check_local_soundness(result) -> CheckReport`：独立符号检查
-  入口包含、块转移精确性、每条守卫边包含、每个 `proved` 断言的包含；
+  入口包含、块转移精确性、每条守卫边包含（区间与同余两部分）、每个 `proved` 断言的包含；
   失败可 `report.raise_if_bad()`。
 - `run_bounded(cfg, initial_stores)`：独立具体语义枚举，
   仅对有界程序完备，状态超预算时 `truncated=True`（明确标记、不冒充证明）。
@@ -84,27 +97,29 @@ from interval_ai import (
 
 1. **控制流**：DFS 三色法识别回边，回边目标为加宽点；枚举顺序为入口可达
    部分的逆后序（RPO，插入顺序打破并列），结果确定。
-2. **上升迭代（延迟加宽）**：每个加宽点的**前两次扩张取凸包 join**，
+2. **联合合流与归约**：区间取凸包；同余不保留任一边，而取 gcd 闭包。例如
+   `1 mod 4` 与 `3 mod 4` 合流为 `1 mod 2`；步长 2 与步长 3 合流为 `m=1`。
+   两个同余不相容，或区间中不存在满足同余的整数点时，状态归约为底。
+3. **上升迭代（延迟加宽）**：每个加宽点的**前两次扩张取凸包 join**，
    **第三次扩张起使用标准区间 widening**——某端点一旦被新迭代值突破就
-   推到相应无穷。加宽是**逐变量选择性**的：只加宽该回边自然循环内被
-   赋值修改的变量；循环内不改、只从外层流入的变量（典型如嵌套循环里
-   外层计数器）取精确凸包，避免被无谓推到无穷且收窄无法恢复。非加宽点
-   直接做方程右端的凸包。上升到后置不动点（一整轮无变化）为止。
-3. **收窄迭代**：上升稳定后做**至多 8 轮**混沌收窄
+   推到相应无穷。同余分量使用 gcd 闭包，循环扩大结果包含两条路径及所有后续
+   可达状态；加宽是**逐变量选择性**的，只加宽循环内被修改的变量。
+4. **收窄迭代**：上升稳定后做**至多 8 轮**混沌收窄
    （`MAX_NARROWING_ROUNDS = 8`），只允许把无穷端点替换为新方程值的
-   有限端点（标准 narrowing，保证不放宽已证结论），提前稳定则提前停。
-4. **断言判定**：在断言所在语句位置的状态上检查观测区间是否**符号包含**
+   有限端点（标准 narrowing，保证不放宽已证结论）；同余只接受不比当前粗的新值。
+5. **断言判定**：在断言所在语句位置的状态上检查观测区间是否**符号包含**
    于要求区间；包含为 `proved`，否则为 `unknown`（无法证明不是错误，
    不抛异常、不输出 violation）。
-5. **独立性**：检查器（`checker.py`）与具体执行器（`concrete.py`）均不
+6. **独立性**：检查器（`checker.py`）与具体执行器（`concrete.py`）均不
    import 被测核心（`transfer`/`engine`），端点算术与守卫补集各自重新
-   实现；测试用 AST 扫描强制该约束。期望值来自手算或独立具体语义，
+   实现，同余 gcd、仿射、求交和单点归约也独立重写；测试用 AST 扫描强制该约束。
+   期望值来自手算或独立具体语义，
    不用被测核心算期望值；往返一致仅作补充。
-6. **预算与无解分离**：区间 widening 保证上升链有限，数学上必然终止；
+7. **预算与无解分离**：区间 widening 保证上升链有限，数学上必然终止；
    `ascending_budget`（默认 10000）只是防御性安全阀，耗尽抛
    `BudgetExhaustedError`（携带 `partial`，但明确不是已验证不动点），
    与 `unknown`（正常数据结论）严格区分。
-7. **失败原子性**：CFG 为冻结结构且构造期完整校验，校验失败不返回对象；
+8. **失败原子性**：CFG 为冻结结构且构造期完整校验，校验失败不返回对象；
    分析过程不修改 CFG，预算异常后 CFG 仍与调用前完全一致
    （有测试保证），无未说明的部分变更。
 
@@ -114,10 +129,18 @@ from interval_ai import (
   无容差**；端点比较是精确整数/符号比较，不用宽容差掩盖边界错误。
 - 输入侧显式拒绝：`NaN`、`±Infinity`、非整数浮点、以及用 `bool`
   冒充整数（`True`/`False` 虽是 `int` 子类，按契约一律拒绝）。
-- 本库只实现本题规定的有限数学子集（无乘除、无数组/堆、无过程调用、
+- 本库只实现本题规定的有限数学子集（支持整数常数乘法；无除法、变量乘法、数组/堆、过程调用、
   无整数溢出模型），**不宣称兼容任何行业标准分析框架**。
 
 ## demo 会真实展示什么
+
+`python demo_iteration.py` 现场计算并打印每个程序点的“区间 / 同余”两部分不变量，以及每条边的独立转移包含关系：
+
+1. 步长 2 循环：区间外包可能含奇数，但 `i ≡ 0 (mod 2)` 保留偶数计数器信息；具体枚举只作补充。
+2. 两条路径步长 2 与步长 3：合流为 `m=1`，不错误保留某一条边的模数。
+3. 负起点、负常数乘法、负常数加法：余数按 Python 数学模归一化，永不进入分支为 bottom。
+4. 入口区间 `[0,0]` 与 `i ≡ 1 (mod 2)` 无合法交点，归约后直接判空。
+5. 真实触发异常路径：负模数抛带定位的 `ValidationError`。
 
 `python demo.py` 固定构造两个程序并真实求解：
 
@@ -134,8 +157,9 @@ from interval_ai import (
 
 - 非关系型区间域：无法推导变量间关系（如 `y = x` 后 `x <= y` 之外的
   关联），存在固有精度损失，部分真命题只能得到 `unknown`。
+- 同余域只支持单变量仿射赋值（复制、加常数、常数乘法）；不表达多项式或变量间同余。
 - 合并一律取凸包：`x=0` 与 `x=10` 合并为 `[0,10]`，不含析取/路径分裂。
-- 仅支持四种语句与两种守卫；入口不可达块（从 entry 不可达）保持 bottom，
+- 仅支持五种语句与两种守卫；入口不可达块（从 entry 不可达）保持 bottom，
   不参与分析。
 - 具体执行器仅适合有界小程序对照；对无界循环会在状态预算处截断并显式
   标记 `truncated=True`，无界情形的健全性由符号检查器承担。
@@ -146,12 +170,13 @@ from interval_ai import (
 ```
 interval_ai/
   errors.py    错误类型与整数参数校验（NaN/Infinity/bool 拒绝）
-  intervals.py 区间与逐变量抽象状态（join/widen/narrow/包含）
+  intervals.py 区间、同余与联合抽象状态（join/widen/narrow/包含/归约）
   cfg.py       CFG/Block/Guard/语句 数据结构与构造期校验
   transfer.py  局部抽象转移（语句、守卫边过滤）
   engine.py    RPO 不动点引擎：延迟加宽 + 至多 8 轮收窄
   checker.py   独立符号包含性检查器（不采样、不依赖核心）
   concrete.py  独立确定性具体执行器（有界程序对照）
-tests/         60 个 unittest 用例（域/引擎/检查器/错误语义/具体覆盖）
-demo.py        固定输入演示
+tests/         77 个 unittest 用例（联合域/引擎/检查器/错误语义/具体覆盖/演示）
+demo.py        旧区间固定输入演示
+demo_iteration.py 本次区间 + 同余增量演示
 ```

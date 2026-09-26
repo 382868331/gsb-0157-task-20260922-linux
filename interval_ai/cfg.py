@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 from .errors import ValidationError, require_int
-from .intervals import Interval
+from .intervals import Congruence, Interval
 
 MAX_VARIABLES = 20
 MAX_BLOCKS = 40
@@ -62,6 +62,16 @@ class AssignAdd:
 
 
 @dataclass(frozen=True, slots=True)
+class AssignMul:
+    target: str
+    source: str
+    const: int
+
+    def __post_init__(self) -> None:
+        require_int(self.const, "AssignMul.const")
+
+
+@dataclass(frozen=True, slots=True)
 class AssertRange:
     """断言 lower <= target <= upper；端点允许为 ``None``（无穷）。
 
@@ -89,7 +99,7 @@ class AssertRange:
             )
 
 
-Statement = AssignConst | AssignCopy | AssignAdd | AssertRange
+Statement = AssignConst | AssignCopy | AssignAdd | AssignMul | AssertRange
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +147,7 @@ class CFG:
     blocks: Mapping[str, Block]
     entry: str
     entry_bounds: Mapping[str, Interval] = field(default_factory=dict)
+    entry_congruences: Mapping[str, Congruence] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._validate()
@@ -240,6 +251,20 @@ class CFG:
                 )
         object.__setattr__(self, "entry_bounds", bounds)
 
+        congruences = dict(self.entry_congruences)
+        for key, val in congruences.items():
+            if key not in vset:
+                raise ValidationError(
+                    f"entry_congruences variable {key!r} is not declared",
+                    f"CFG.entry_congruences[{key!r}]",
+                )
+            if not isinstance(val, Congruence):
+                raise ValidationError(
+                    f"entry congruence must be Congruence, got {type(val).__name__}",
+                    f"CFG.entry_congruences[{key!r}]",
+                )
+        object.__setattr__(self, "entry_congruences", congruences)
+
     def _validate_statement(self, st: object, loc: str, vset: set[str]) -> None:
         if isinstance(st, AssignConst):
             if st.target not in vset:
@@ -256,6 +281,15 @@ class CFG:
                     f"source {st.source!r} is not declared", f"{loc}.source"
                 )
         elif isinstance(st, AssignAdd):
+            if st.target not in vset:
+                raise ValidationError(
+                    f"target {st.target!r} is not declared", f"{loc}.target"
+                )
+            if st.source not in vset:
+                raise ValidationError(
+                    f"source {st.source!r} is not declared", f"{loc}.source"
+                )
+        elif isinstance(st, AssignMul):
             if st.target not in vset:
                 raise ValidationError(
                     f"target {st.target!r} is not declared", f"{loc}.target"
@@ -283,4 +317,9 @@ class CFG:
     def initial_state_intervals(self) -> dict[str, Interval]:
         top = {v: Interval.top() for v in self.variables}
         top.update(self.entry_bounds)
+        return top
+
+    def initial_state_congruences(self) -> dict[str, Congruence]:
+        top = {v: Congruence.top() for v in self.variables}
+        top.update(self.entry_congruences)
         return top

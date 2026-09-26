@@ -15,11 +15,12 @@ from .cfg import (
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssignMul,
     Block,
     Guard,
     Statement,
 )
-from .intervals import AbstractState, Interval
+from .intervals import AbstractState, Congruence, Interval
 
 
 def guard_interval(guard: Guard, taken: bool) -> Interval:
@@ -36,11 +37,44 @@ def transfer_statement(state: AbstractState, stmt: Statement) -> AbstractState:
     if state.bottom:
         return state
     if isinstance(stmt, AssignConst):
-        return state.assign(stmt.target, Interval.singleton(stmt.const))
+        return state.assign(
+            stmt.target,
+            Interval.singleton(stmt.const),
+            Congruence.exact(stmt.const),
+        )
     if isinstance(stmt, AssignCopy):
-        return state.assign(stmt.target, state.get(stmt.source))
+        return state.assign(
+            stmt.target,
+            state.get(stmt.source),
+            state.get_congruence(stmt.source),
+        )
     if isinstance(stmt, AssignAdd):
-        return state.assign(stmt.target, state.get(stmt.source).add(stmt.const))
+        source_interval = state.get(stmt.source)
+        return state.assign(
+            stmt.target,
+            source_interval.add(stmt.const),
+            state.get_congruence(stmt.source).affine(1, stmt.const),
+        )
+    if isinstance(stmt, AssignMul):
+        source_interval = state.get(stmt.source)
+        c = stmt.const
+        if c == 0:
+            target_interval = Interval.singleton(0)
+        elif c < 0:
+            target_interval = Interval(
+                None if source_interval.upper is None else source_interval.upper * c,
+                None if source_interval.lower is None else source_interval.lower * c,
+            )
+        else:
+            target_interval = Interval(
+                None if source_interval.lower is None else source_interval.lower * c,
+                None if source_interval.upper is None else source_interval.upper * c,
+            )
+        return state.assign(
+            stmt.target,
+            target_interval,
+            state.get_congruence(stmt.source).affine(c, 0),
+        )
     if isinstance(stmt, AssertRange):
         return state  # 断言不改变状态
     raise TypeError(f"unsupported statement: {type(stmt).__name__}")  # pragma: no cover

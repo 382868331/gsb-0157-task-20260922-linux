@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import gcd
 
 from .cfg import (
     CFG,
@@ -27,14 +28,16 @@ from .cfg import (
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssignMul,
     Block,
     Guard,
     Statement,
 )
-from .intervals import AbstractState, Interval
+from .intervals import AbstractState, Congruence, Interval
 
 # 参考域端点：None = 无穷。为保持独立性，不复用 intervals.py 里的比较函数。
 Bound = tuple[int | None, int | None]  # (lower, upper)
+Value = tuple[Bound, Congruence]
 _BOTTOM = object()  # 参考状态底标记
 _RefState = object  # dict[str, Bound] 或 _BOTTOM（仅作文档别名）
 
@@ -98,12 +101,77 @@ def _ref_intersect_iv(a: Bound, b: Bound) -> Bound | None:
     return (lo, hi)
 
 
+def _ref_has_congruence(iv: Bound, cong: Congruence) -> bool:
+    if cong.modulus == 0:
+        lo, hi = iv
+        return (lo is None or cong.remainder >= lo) and (hi is None or cong.remainder <= hi)
+    if cong.modulus == 1 or iv[0] is None:
+        return True
+    first = iv[0] + ((cong.remainder - iv[0]) % cong.modulus)
+    return iv[1] is None or first <= iv[1]
+
+
+def _ref_join_cong(a: Congruence, b: Congruence) -> Congruence:
+    if a.modulus == 0 and b.modulus == 0:
+        return a if a.remainder == b.remainder else Congruence(
+            abs(a.remainder - b.remainder), a.remainder
+        )
+    modulus = gcd(a.modulus, b.modulus, abs(a.remainder - b.remainder))
+    return Congruence(modulus, 0 if modulus == 0 else a.remainder % modulus)
+
+
+def _ref_intersect_cong(a: Congruence, b: Congruence) -> Congruence | None:
+    if a.modulus == 0:
+        return a if b.contains_int(a.remainder) else None
+    if b.modulus == 0:
+        return b if a.contains_int(b.remainder) else None
+    g = gcd(a.modulus, b.modulus)
+    if (b.remainder - a.remainder) % g:
+        return None
+    modulus = a.modulus // g * b.modulus
+    if modulus == 1:
+        return Congruence.top()
+    step = a.modulus
+    aa, bb = a.modulus // g, b.modulus // g
+    delta = (b.remainder - a.remainder) // g
+    if bb == 1:
+        k = 0
+    else:
+        old_r, r = aa, bb
+        old_s, s = 1, 0
+        while r:
+            q = old_r // r
+            old_r, r = r, old_r - q * r
+            old_s, s = s, old_s - q * s
+        k = (delta * old_s) % bb
+    value = a.remainder + step * k
+    return Congruence(modulus, value % modulus)
+
+
+def _ref_affine_cong(cong: Congruence, coefficient: int, constant: int) -> Congruence:
+    if cong.modulus == 0 or coefficient == 0:
+        return Congruence.exact((coefficient * cong.remainder if cong.modulus == 0 else 0) + constant)
+    modulus = abs(coefficient) * cong.modulus
+    return Congruence(modulus, (coefficient * cong.remainder + constant) % modulus)
+
+
+def _ref_mul_iv(a: Bound, k: int) -> Bound:
+    if k == 0:
+        return (0, 0)
+    if k > 0:
+        return (None if a[0] is None else a[0] * k, None if a[1] is None else a[1] * k)
+    return (None if a[1] is None else a[1] * k, None if a[0] is None else a[0] * k)
+
+
 # -- 参考状态与独立转移 --------------------------------------------------------
 
 def _from_abstract(state: AbstractState):
     if state.bottom:
         return _BOTTOM
-    return {v: (state.bounds[v].lower, state.bounds[v].upper) for v in state.variables}
+    return {
+        v: ((state.bounds[v].lower, state.bounds[v].upper), state.residues[v])
+        for v in state.variables
+    }
 
 
 def _ref_transfer_stmt(env, stmt: Statement):
@@ -111,11 +179,15 @@ def _ref_transfer_stmt(env, stmt: Statement):
         return _BOTTOM
     out = dict(env)
     if isinstance(stmt, AssignConst):
-        out[stmt.target] = (stmt.const, stmt.const)
+        out[stmt.target] = ((stmt.const, stmt.const), Congruence.exact(stmt.const))
     elif isinstance(stmt, AssignCopy):
         out[stmt.target] = out[stmt.source]
     elif isinstance(stmt, AssignAdd):
-        out[stmt.target] = _ref_add_iv(out[stmt.source], stmt.const)
+        iv, cong = out[stmt.source]
+        out[stmt.target] = (_ref_add_iv(iv, stmt.const), _ref_affine_cong(cong, 1, stmt.const))
+    elif isinstance(stmt, AssignMul):
+        iv, cong = out[stmt.source]
+        out[stmt.target] = (_ref_mul_iv(iv, stmt.const), _ref_affine_cong(cong, stmt.const, 0))
     elif isinstance(stmt, AssertRange):
         pass  # 检查性语句不改变状态
     else:  # pragma: no cover - CFG 构造期已挡住
@@ -133,11 +205,15 @@ def _ref_transfer_block(state: AbstractState, block: Block):
 def _ref_filter_guard(env, guard: Guard, taken: bool):
     if env is _BOTTOM:
         return _BOTTOM
-    hit = _ref_intersect_iv(env[guard.variable], _ref_guard_bound(guard, taken))
-    if hit is None:
+    old_iv, old_cong = env[guard.variable]
+    hit_iv = _ref_intersect_iv(old_iv, _ref_guard_bound(guard, taken))
+    hit_cong = old_cong
+    if hit_iv is not None and hit_iv[0] is not None and hit_iv[0] == hit_iv[1]:
+        hit_cong = _ref_intersect_cong(hit_cong, Congruence.exact(hit_iv[0]))
+    if hit_iv is None or hit_cong is None or not _ref_has_congruence(hit_iv, hit_cong):
         return _BOTTOM
     out = dict(env)
-    out[guard.variable] = hit
+    out[guard.variable] = (hit_iv, hit_cong)
     return out
 
 
@@ -149,7 +225,10 @@ def _ref_state_subseteq(a, b) -> bool:
         return False
     if set(a) != set(b):
         return False
-    return all(_ref_iv_subseteq(a[v], b[v]) for v in a)
+    return all(
+        _ref_iv_subseteq(a[v][0], b[v][0]) and a[v][1].subseteq(b[v][1])
+        for v in a
+    )
 
 
 # -- 报告 ----------------------------------------------------------------------
@@ -218,11 +297,17 @@ def check_local_soundness(result, cfg: CFG | None = None) -> CheckReport:
 
     # 1) 入口初始区间 ⊆ 入口块入不变量
     entry_in = _from_abstract(result.block_in[cfg.entry])
-    initial = {
-        v: cfg.entry_bounds[v] if v in cfg.entry_bounds else Interval(None, None)
+    initial_ref = _BOTTOM if result.block_in[cfg.entry].bottom else {
+        v: (
+            (
+                (cfg.entry_bounds[v].lower, cfg.entry_bounds[v].upper)
+                if v in cfg.entry_bounds
+                else (None, None)
+            ),
+            cfg.entry_congruences.get(v, Congruence.top()),
+        )
         for v in cfg.variables
     }
-    initial_ref = {v: (iv.lower, iv.upper) for v, iv in initial.items()}
     if not _ref_state_subseteq(initial_ref, entry_in):
         report.fail(f"block {cfg.entry!r}.in", "does not contain declared entry bounds")
 

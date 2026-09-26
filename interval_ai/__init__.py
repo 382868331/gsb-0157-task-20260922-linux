@@ -29,6 +29,7 @@ from .cfg import (
     AssignAdd,
     AssignConst,
     AssignCopy,
+    AssignMul,
     Block,
     CFG,
     Guard,
@@ -46,7 +47,7 @@ from .engine import (
     analyze,
 )
 from .errors import BudgetExhaustedError, IntervalAIError, ValidationError
-from .intervals import AbstractState, Interval
+from .intervals import AbstractState, Congruence, Interval, interval_has_congruence
 from .concrete import ConcreteBudget, ConcreteReport, run_bounded
 from .transfer import edge_state, guard_interval, transfer_block, transfer_statement
 
@@ -58,11 +59,14 @@ __all__ = [
     "AssignConst",
     "AssignCopy",
     "AssignAdd",
+    "AssignMul",
     "AssertRange",
     "MAX_VARIABLES",
     "MAX_BLOCKS",
     # domain
     "Interval",
+    "Congruence",
+    "interval_has_congruence",
     "AbstractState",
     # engine
     "analyze",
